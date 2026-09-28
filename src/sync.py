@@ -344,6 +344,8 @@ def sync_ssh_server(
     ssh = paramiko.SSHClient()
     # WarningPolicy is deliberate — it logs unknown host keys but still connects.
     # Upgrade to RejectPolicy + known_hosts once we ship a pinning workflow.
+    # Known hosts are still enforced: a changed key raises BadHostKeyException.
+    ssh.load_system_host_keys()
     ssh.set_missing_host_key_policy(paramiko.WarningPolicy())  # noqa: S507  # nosec B507
 
     try:

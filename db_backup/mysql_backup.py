@@ -148,6 +148,7 @@ def transfer_backup_to_server(config, backup_file, logger=None):
 
         # Initialize SSH client
         ssh = paramiko.SSHClient()
+        ssh.load_system_host_keys()
         ssh.set_missing_host_key_policy(paramiko.WarningPolicy())
 
         # Try connecting to the remote server

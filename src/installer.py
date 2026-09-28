@@ -9,7 +9,9 @@ Performs the OS-level setup that ``preflight.py`` relies on:
   3. Appends a hardened ``nofail`` entry to ``/etc/fstab`` so the volume
      comes back automatically on reboot.
   4. Installs ``/etc/sudoers.d/backup-handler`` with the minimum NOPASSWD
-     rules preflight needs to self-heal a missing mount on its own.
+     rules preflight needs to self-heal a missing mount on its own. No
+     fstab-write rule is granted (it would be root-equivalent); the
+     installer writes fstab itself while running as root.
   5. Installs a local MTA (postfix configured "Local only" + bsd-mailx)
      when none is present, so the DNS-independent ``local_mail_to``
      channel works during the exact failure modes that disabled
@@ -38,6 +40,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -194,7 +197,7 @@ def step_destination(
 # ─── Step: fstab ────────────────────────────────────────────────────────────
 
 
-_FSTAB_OPTS = "defaults,nofail,x-systemd.device-timeout=30"
+_FSTAB_OPTS = "defaults,nosuid,nodev,nofail,x-systemd.device-timeout=30"
 
 
 def step_fstab(
@@ -255,8 +258,33 @@ def step_fstab(
 # ─── Step: sudoers ──────────────────────────────────────────────────────────
 
 
+# Values interpolated into sudoers must not be able to smuggle in extra
+# commands (``,``), wildcards, or whitespace-separated arguments.
+_SUDOERS_OWNER_RE = re.compile(r"^[a-z_][a-z0-9_-]*\$?$")
+_SUDOERS_PATH_RE = re.compile(r"^/[A-Za-z0-9._/-]*$")
+_SUDOERS_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _validate_sudoers_inputs(owner: str, mount_point: str, label: str | None, uuid: str | None) -> str | None:
+    """Return an error message if any value is unsafe to place in sudoers."""
+    if not _SUDOERS_OWNER_RE.match(owner):
+        return f"expected_owner {owner!r} is not a valid user name"
+    if not _SUDOERS_PATH_RE.match(mount_point) or ".." in mount_point.split("/"):
+        return f"mount point {mount_point!r} contains characters not allowed in sudoers"
+    if label and not _SUDOERS_TOKEN_RE.match(label):
+        return f"expected_label {label!r} contains characters not allowed in sudoers"
+    if uuid and not _SUDOERS_TOKEN_RE.match(uuid):
+        return f"expected_uuid {uuid!r} contains characters not allowed in sudoers"
+    return None
+
+
 def _render_sudoers(owner: str, mount_point: str, label: str | None, uuid: str | None) -> str:
-    """Render the sudoers content for the given identity."""
+    """Render the sudoers content for the given identity.
+
+    Only ``mount`` of the configured volume is granted. A NOPASSWD rule for
+    ``tee -a /etc/fstab`` is deliberately NOT emitted: appending arbitrary
+    fstab lines (e.g. a ``user,suid`` entry) is equivalent to root.
+    """
     lines = [
         "# Installed by backup-handler --install. Do NOT edit by hand —",
         "# re-run the installer to update. Validated with visudo -cf",
@@ -271,8 +299,6 @@ def _render_sudoers(owner: str, mount_point: str, label: str | None, uuid: str |
     if label:
         lines.append(f"{owner} ALL=(root) NOPASSWD: /usr/bin/mount LABEL={label} {mount_point}")
         lines.append(f"{owner} ALL=(root) NOPASSWD: /bin/mount LABEL={label} {mount_point}")
-    lines.append(f"{owner} ALL=(root) NOPASSWD: /usr/bin/tee -a /etc/fstab")
-    lines.append(f"{owner} ALL=(root) NOPASSWD: /bin/tee -a /etc/fstab")
     return "\n".join(lines) + "\n"
 
 
@@ -287,6 +313,10 @@ def step_sudoers(
     """Install /etc/sudoers.d/backup-handler with the minimum NOPASSWD rules."""
     if not owner:
         return StepResult("sudoers", ok=True, skipped=True, message="no expected_owner — skipping")
+
+    invalid = _validate_sudoers_inputs(owner, mount_point, label, uuid)
+    if invalid:
+        return StepResult("sudoers", ok=False, message=f"refusing to write sudoers: {invalid}")
 
     desired = _render_sudoers(owner, mount_point, label, uuid)
 

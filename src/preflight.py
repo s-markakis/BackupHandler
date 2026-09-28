@@ -21,7 +21,10 @@ What this module guarantees by the time it returns ok=True:
 If any check fails and self-heal is enabled, the module attempts to
 remount the volume (``sudo -n mount LABEL=...``), append the missing
 fstab entry (``sudo -n tee -a /etc/fstab``), or chown the destination.
-Self-heal requires sudoers rules — see RUNBOOK.md §5.
+Self-heal requires sudoers rules — see RUNBOOK.md §4. The installer does
+not grant ``tee -a /etc/fstab`` (root-equivalent), so fstab self-heal
+only succeeds if an operator adds that rule deliberately; ``--install``
+writes the fstab entry up front instead.
 
 Independent alerting:
   * ``write_status_sentinel`` writes ``Logs/last_run_status.json`` so a
@@ -178,7 +181,7 @@ def _ensure_fstab_entry(
     label: str | None,
     uuid: str | None,
     fs_type: str,
-    options: str = "defaults,nofail,x-systemd.device-timeout=30",
+    options: str = "defaults,nosuid,nodev,nofail,x-systemd.device-timeout=30",
 ) -> bool:
     """
     Ensure /etc/fstab has an entry for the expected device.

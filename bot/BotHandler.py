@@ -23,6 +23,7 @@ class TelegramBot:
             raise FileNotFoundError(f"Configuration file '{CONFIG_FILE}' not found.")
         self.api_token = config['TELEGRAM']['api_token']
         self._config_user_ids = config['USERS']['interacted_users']
+        self.allowed_users = self._parse_user_ids(self._config_user_ids)
         self.bot = telebot.TeleBot(self.api_token)
         self.interacted_users = []
         self.polling_thread = None
@@ -38,6 +39,16 @@ class TelegramBot:
         @self.bot.message_handler(func=lambda message: True)
         def handle_any_message(message):
             user_id = message.chat.id
+            # Only chat IDs listed in bot_config.ini may subscribe. Anyone can
+            # message a public bot, and subscribers receive backup passwords.
+            if user_id not in self.allowed_users:
+                self.logger.warning(f"Ignoring Telegram message from unauthorized chat ID {user_id}")
+                self.bot.send_message(
+                    user_id,
+                    f"Not authorized. Ask the administrator to add chat ID {user_id} "
+                    "to [USERS] interacted_users in bot_config.ini.",
+                )
+                return
             if user_id not in self.interacted_users:
                 self.interacted_users.append(user_id)
                 self.save_interacted_users()
@@ -60,26 +71,41 @@ class TelegramBot:
             self.logger.error(f"Unexpected error occurred while retrieving username for user ID {user_id}: {e}")
             return None
 
+    @staticmethod
+    def _parse_user_ids(raw):
+        """Parse a comma-separated list of numeric chat IDs, skipping placeholders."""
+        ids = []
+        for uid in (raw or '').split(','):
+            uid = uid.strip()
+            try:
+                ids.append(int(uid))
+            except ValueError:
+                continue
+        return ids
+
     def load_interacted_users(self):
         """
         Loads interacted users from runtime JSON file, falling back to config values.
         The runtime file is separate from bot_config.ini to avoid writing back to config.
+        Runtime entries not present in the config allowlist are dropped.
         """
         # Try runtime file first
         if os.path.exists(_RUNTIME_USERS_FILE):
             try:
                 with open(_RUNTIME_USERS_FILE, 'r') as f:
                     data = json.load(f)
-                self.interacted_users = data.get('user_ids', [])
+                runtime_ids = data.get('user_ids', [])
+                self.interacted_users = [uid for uid in runtime_ids if uid in self.allowed_users]
+                dropped = len(runtime_ids) - len(self.interacted_users)
+                if dropped:
+                    self.logger.warning(f"Dropped {dropped} unauthorized chat ID(s) from runtime users file")
+                    self.save_interacted_users()
                 return
             except (json.JSONDecodeError, OSError) as e:
                 self.logger.warning(f"Failed to read runtime users file: {e}")
 
         # Fall back to config values
-        if self._config_user_ids:
-            self.interacted_users = [int(uid) for uid in self._config_user_ids.split(',') if uid.strip()]
-        else:
-            self.interacted_users = []
+        self.interacted_users = list(self.allowed_users)
 
     def save_interacted_users(self):
         """
@@ -87,7 +113,8 @@ class TelegramBot:
         Does not modify bot_config.ini.
         """
         try:
-            with open(_RUNTIME_USERS_FILE, 'w') as f:
+            fd = os.open(_RUNTIME_USERS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w') as f:
                 json.dump({'user_ids': self.interacted_users}, f)
         except OSError as e:
             self.logger.error(f"Failed to save runtime users file: {e}")

@@ -8,7 +8,9 @@ such as authentication failures.
 """
 
 import contextlib
+import html as html_lib
 import smtplib
+import ssl
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -22,6 +24,10 @@ def _build_html_body(subject, body):
         status_color = "#28a745"
     else:
         status_color = "#007bff"
+
+    # Subject/body can contain file paths and error text — escape them.
+    subject = html_lib.escape(subject)
+    body = html_lib.escape(body)
 
     return f"""\
 <html>
@@ -95,7 +101,9 @@ def send_smtp_email(
             # Establish SMTP connection with a 30-second timeout
             server = smtplib.SMTP(smtp_host, smtp_port, timeout=30)
             if use_tls:
-                server.starttls()
+                # Explicit context: smtplib's default does not verify the
+                # server certificate, which would expose credentials to MITM.
+                server.starttls(context=ssl.create_default_context())
             if smtp_user and smtp_password:
                 server.login(smtp_user, smtp_password)
             server.sendmail(from_addr, to_addrs, msg.as_string())

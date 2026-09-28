@@ -8,7 +8,8 @@ headers. Compatible with Slack, Discord, Microsoft Teams, and custom endpoints.
 Security:
     URLs are validated against an allowlist of schemes (``http``/``https``)
     to prevent SSRF against local services or file:// leakage. Response body
-    snippets in logs are truncated to 200 characters.
+    snippets in logs are truncated to 200 characters. URLs are logged as
+    scheme://host only, since Slack/Discord/Teams URLs embed their token.
 """
 
 from __future__ import annotations
@@ -17,6 +18,15 @@ from urllib.parse import urlparse
 
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
 _MAX_BODY_SNIPPET = 200
+
+
+def _redact_url(url: str) -> str:
+    """Reduce a URL to scheme://host for logging; paths often embed secrets."""
+    try:
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.hostname}/…" if parsed.hostname else "<invalid url>"
+    except ValueError:
+        return "<invalid url>"
 
 
 def _validate_url(url: str) -> str | None:
@@ -83,11 +93,11 @@ def send_webhook(
             timeout=timeout,
         )
     except requests.RequestException as exc:
-        logger.error(f"Failed to send webhook to {url}: {exc}")
+        logger.error(f"Failed to send webhook to {_redact_url(url)}: {type(exc).__name__}")
         return False
 
     if response.ok:
-        logger.info(f"Webhook notification sent to {url}")
+        logger.info(f"Webhook notification sent to {_redact_url(url)}")
         return True
 
     snippet = response.text[:_MAX_BODY_SNIPPET] if response.text else ""

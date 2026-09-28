@@ -1,4 +1,5 @@
 import os
+import ssl
 import time
 import smtplib
 import configparser
@@ -157,7 +158,8 @@ def send_via_smtp(sender_email, app_password, receiver_emails, message, logger=N
     last_error = None
     for attempt in range(1, _SMTP_MAX_RETRIES + 1):
         try:
-            with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
+            # Explicit context: SMTP_SSL's default does not verify the certificate.
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, context=ssl.create_default_context()) as server:
                 server.login(sender_email, app_password)
                 server.sendmail(sender_email, receiver_emails, message.as_string())
 

@@ -109,3 +109,11 @@ class TestSMTPEmail:
         )
         assert result is True
         assert mock_smtp_class.call_count == 3
+
+
+def test_html_body_escapes_markup():
+    from src.email_notify import _build_html_body
+
+    html = _build_html_body("<b>x</b>", "file <script>alert(1)</script>.txt")
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html

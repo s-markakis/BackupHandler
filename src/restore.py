@@ -87,6 +87,16 @@ def _parse_s3_path(path):
 # ─── Remote Download Handlers ───────────────────────────────────────────────
 
 
+def _is_within(base, candidate):
+    """Return True if ``candidate`` resolves to a path inside ``base``."""
+    base = Path(base).resolve()
+    try:
+        Path(candidate).resolve().relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
 def _download_from_ssh(logger, ssh_path, local_dir, ssh_password=None):
     """
     Download an entire remote directory via SFTP to a local directory.
@@ -115,6 +125,8 @@ def _download_from_ssh(logger, ssh_path, local_dir, ssh_password=None):
     ssh = paramiko.SSHClient()
     # WarningPolicy is deliberate — it logs unknown host keys but still connects.
     # Upgrade to RejectPolicy + known_hosts once we ship a pinning workflow.
+    # Known hosts are still enforced: a changed key raises BadHostKeyException.
+    ssh.load_system_host_keys()
     ssh.set_missing_host_key_policy(paramiko.WarningPolicy())  # noqa: S507  # nosec B507
 
     try:
@@ -152,6 +164,10 @@ def _sftp_download_recursive(sftp, remote_dir, local_dir, logger):
         return
 
     for entry in entries:
+        # A malicious server can return names like "../x" or "a/b".
+        if entry.filename in ("", ".", "..") or "/" in entry.filename or "\\" in entry.filename:
+            logger.warning(f"Skipping unsafe remote file name: {entry.filename!r}")
+            continue
         remote_entry = f"{remote_dir}/{entry.filename}"
         local_entry = local_dir / entry.filename
 
@@ -220,6 +236,10 @@ def _download_from_s3(logger, s3_path, local_dir, region=None, access_key=None, 
                     continue
 
                 local_file = local_dir / relative
+                # Object keys are attacker-influenced; never write outside local_dir.
+                if Path(relative).is_absolute() or not _is_within(local_dir, local_file):
+                    logger.warning(f"Skipping S3 object with unsafe key: {key!r}")
+                    continue
                 local_file.parent.mkdir(parents=True, exist_ok=True)
                 s3.download_file(bucket, key, str(local_file))
                 downloaded += 1
@@ -537,9 +557,14 @@ def _restore_with_manifests(logger, from_dir, to_dir, timestamp):
                 if matches:
                     src = matches[0]
                     break
+        else:
+            src = from_dir / src
 
-        if not src.exists():
-            logger.warning(f"Source file not found for restore: {file_path}")
+        # Only restore files that live inside the backup. Without this check an
+        # absolute manifest path that is not in the backup would be copied from
+        # the live system (wrong data, and a way to exfiltrate arbitrary files).
+        if not src.exists() or not _is_within(from_dir, src):
+            logger.warning(f"Source file not found in backup for restore: {file_path}")
             failed += 1
             continue
 

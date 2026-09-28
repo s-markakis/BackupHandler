@@ -13,6 +13,8 @@ import contextlib
 import json
 import os
 import platform
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -43,6 +45,38 @@ def _run_single(cmd, timeout=30, shell=False):
     """Run a command and return stdout as a single string, or None."""
     lines = _run(cmd, timeout=timeout, shell=shell)  # nosec B604
     return "\n".join(lines) if lines else None
+
+
+def _write_private(path, text, mode=0o600):
+    """Write ``text`` to ``path`` readable only by the owner.
+
+    Snapshots and generated restore scripts carry dotfiles, crontabs and
+    environment variables, which routinely contain tokens.
+    """
+    path = Path(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    path.chmod(mode)  # O_CREAT mode is ignored when the file already exists
+
+
+def _q(value):
+    """Shell-quote a value taken from a snapshot for use in the bash restore script."""
+    return shlex.quote(str(value))
+
+
+def _ps_q(value):
+    """Quote a value as a PowerShell single-quoted string literal."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+_SAFE_FILENAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _is_safe_relpath(rel_path):
+    """True if ``rel_path`` is relative and stays inside its base directory."""
+    p = Path(rel_path)
+    return bool(rel_path) and not p.is_absolute() and ".." not in p.parts
 
 
 def _which(name):
@@ -861,7 +895,7 @@ def create_snapshot(logger, output_dir=None, output_file=None):
         out_path = Path.cwd() / f"snapshot_{hostname}_{timestamp}.json"
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False))
+    _write_private(out_path, json.dumps(snapshot, indent=2, ensure_ascii=False))
 
     logger.info(f"Snapshot saved to {out_path}")
     return str(out_path)
@@ -946,8 +980,8 @@ def _generate_linux_restore(logger, snapshot, output_path=None):
         'warn() { echo -e "${YELLOW}[WARNING]${NC} $1"; }',
         'err() { echo -e "${RED}[ERROR]${NC} $1"; }',
         "",
-        f'ORIGINAL_USER="{metadata.get("user", "")}"',
-        f'ORIGINAL_HOME="{metadata.get("home", "")}"',
+        f'ORIGINAL_USER={_q(metadata.get("user", ""))}',
+        f'ORIGINAL_HOME={_q(metadata.get("home", ""))}',
         "",
         "# Detect current user (script runs as root, restore to actual user)",
         'if [ -n "${SUDO_USER:-}" ]; then',
@@ -981,10 +1015,12 @@ def _generate_linux_restore(logger, snapshot, output_path=None):
             fname = src.get("file", "")
             content = src.get("content", "")
             if fname and content:
-                # Escape content for heredoc
-                lines.append(f"cat > /etc/apt/sources.list.d/{fname} << 'REPOEOF'")
-                lines.append(content)
-                lines.append("REPOEOF")
+                if not _SAFE_FILENAME_RE.match(fname):
+                    logger.warning(f"Skipping APT source with unsafe file name: {fname!r}")
+                    continue
+                # base64 so file content can never terminate a heredoc early
+                encoded = base64.b64encode(content.encode()).decode()
+                lines.append(f'echo "{encoded}" | base64 -d > /etc/apt/sources.list.d/{fname}')
                 lines.append("")
         lines.append("apt-get update")
         lines.append("")
@@ -1000,7 +1036,7 @@ def _generate_linux_restore(logger, snapshot, output_path=None):
         for i in range(0, len(apt_pkgs), 20):
             chunk = apt_pkgs[i : i + 20]
             lines.append(
-                f'apt-get install -y {" ".join(chunk)} || warn "Some APT packages failed to install"'
+                f'apt-get install -y {" ".join(_q(p) for p in chunk)} || warn "Some APT packages failed to install"'
             )
         lines.append("")
 
@@ -1015,7 +1051,9 @@ def _generate_linux_restore(logger, snapshot, output_path=None):
             name = pkg["name"] if isinstance(pkg, dict) else pkg
             classic = pkg.get("classic", False) if isinstance(pkg, dict) else False
             classic_flag = " --classic" if classic else ""
-            lines.append(f'snap install {name}{classic_flag} || warn "Failed to install snap: {name}"')
+            lines.append(
+                f"snap install {_q(name)}{classic_flag} || warn {_q('Failed to install snap: ' + str(name))}"
+            )
         lines.append("")
 
     # ── Phase 4: Flatpak packages ──
@@ -1030,7 +1068,9 @@ def _generate_linux_restore(logger, snapshot, output_path=None):
         )
         for pkg in flatpak_pkgs:
             app_id = pkg["app_id"] if isinstance(pkg, dict) else pkg
-            lines.append(f'flatpak install -y flathub {app_id} || warn "Failed to install flatpak: {app_id}"')
+            lines.append(
+                f"flatpak install -y flathub {_q(app_id)} || warn {_q('Failed to install flatpak: ' + str(app_id))}"
+            )
         lines.append("")
 
     # ── Phase 5: Pip/pipx packages ──
@@ -1045,11 +1085,15 @@ def _generate_linux_restore(logger, snapshot, output_path=None):
             lines.append(f'log "Installing {len(pipx_pkgs)} pipx packages..."')
             lines.append("run_as_user pipx ensurepath 2>/dev/null || true")
             for pkg in pipx_pkgs:
-                lines.append(f'run_as_user pipx install {pkg} || warn "Failed to install pipx: {pkg}"')
+                lines.append(
+                    f"run_as_user pipx install {_q(pkg)} || warn {_q('Failed to install pipx: ' + str(pkg))}"
+                )
         if pip_user_pkgs:
             lines.append(f'log "Installing {len(pip_user_pkgs)} pip user packages..."')
             for pkg in pip_user_pkgs:
-                lines.append(f'run_as_user pip install --user {pkg} || warn "Failed to install pip: {pkg}"')
+                lines.append(
+                    f"run_as_user pip install --user {_q(pkg)} || warn {_q('Failed to install pip: ' + str(pkg))}"
+                )
         lines.append("")
 
     # ── Phase 6: npm global packages ──
@@ -1059,7 +1103,7 @@ def _generate_linux_restore(logger, snapshot, output_path=None):
         lines.append("# Phase 6: npm Global Packages")
         lines.append("# ═══════════════════════════════════════════════════════════════════")
         lines.append(f'log "Installing {len(npm_pkgs)} npm global packages..."')
-        lines.append(f'npm install -g {" ".join(npm_pkgs)} || warn "Some npm packages failed"')
+        lines.append(f'npm install -g {" ".join(_q(p) for p in npm_pkgs)} || warn "Some npm packages failed"')
         lines.append("")
 
     # ── Phase 7: Cargo packages ──
@@ -1076,7 +1120,9 @@ def _generate_linux_restore(logger, snapshot, output_path=None):
         lines.append("fi")
         for pkg in cargo_pkgs:
             name = pkg["name"] if isinstance(pkg, dict) else pkg
-            lines.append(f'run_as_user cargo install {name} || warn "Failed to install cargo: {name}"')
+            lines.append(
+                f"run_as_user cargo install {_q(name)} || warn {_q('Failed to install cargo: ' + str(name))}"
+            )
         lines.append("")
 
     # ── Phase 8: VS Code extensions ──
@@ -1088,7 +1134,7 @@ def _generate_linux_restore(logger, snapshot, output_path=None):
         lines.append(f'log "Installing {len(vscode_exts)} VS Code extensions..."')
         lines.append("if command -v code &>/dev/null; then")
         for ext in vscode_exts:
-            lines.append(f"    run_as_user code --install-extension {ext} --force || true")
+            lines.append(f"    run_as_user code --install-extension {_q(ext)} --force || true")
         lines.append("else")
         lines.append('    warn "VS Code not found — install it first, then re-run this section"')
         lines.append("fi")
@@ -1116,6 +1162,10 @@ def _generate_linux_restore(logger, snapshot, output_path=None):
         lines.append("# ═══════════════════════════════════════════════════════════════════")
         lines.append(f'log "Restoring {len(dotfiles)} dotfiles..."')
         for rel_path, content in dotfiles.items():
+            if not _is_safe_relpath(rel_path):
+                logger.warning(f"Skipping dotfile with unsafe path: {rel_path!r}")
+                continue
+            rel_path = rel_path.replace('"', "").replace("$", "").replace("`", "").replace("\\", "")
             full_path = f"$TARGET_HOME/{rel_path}"
             dir_path = str(Path(rel_path).parent)
             if dir_path != ".":
@@ -1156,10 +1206,12 @@ def _generate_linux_restore(logger, snapshot, output_path=None):
         lines.append("# Phase 13: /etc/fstab (REVIEW BEFORE APPLYING)")
         lines.append("# ═══════════════════════════════════════════════════════════════════")
         lines.append('log "Original /etc/fstab saved for reference..."')
-        lines.append("cat << 'FSTABEOF' > /tmp/original_fstab.txt")
-        lines.append(fstab)
-        lines.append("FSTABEOF")
-        lines.append('warn "Original fstab saved to /tmp/original_fstab.txt — review and merge manually"')
+        # Saved under the target home, not a predictable /tmp path (root symlink hazard)
+        encoded = base64.b64encode(fstab.encode()).decode()
+        lines.append(f'echo "{encoded}" | base64 -d > "$TARGET_HOME/original_fstab.txt"')
+        lines.append(
+            'warn "Original fstab saved to $TARGET_HOME/original_fstab.txt — review and merge manually"'
+        )
         lines.append("")
 
     # ── Phase 14: /etc/hosts ──
@@ -1169,11 +1221,8 @@ def _generate_linux_restore(logger, snapshot, output_path=None):
         lines.append("# Phase 14: /etc/hosts Custom Entries")
         lines.append("# ═══════════════════════════════════════════════════════════════════")
         lines.append('log "Appending custom host entries..."')
-        lines.append("cat >> /etc/hosts << 'HOSTSEOF'")
-        lines.append("")
-        lines.append("# --- Restored from snapshot ---")
-        lines.append(hosts)
-        lines.append("HOSTSEOF")
+        encoded = base64.b64encode(f"\n# --- Restored from snapshot ---\n{hosts}\n".encode()).decode()
+        lines.append(f'echo "{encoded}" | base64 -d >> /etc/hosts')
         lines.append("")
 
     # ── Reminders ──
@@ -1191,7 +1240,9 @@ def _generate_linux_restore(logger, snapshot, output_path=None):
     if ssh_keys:
         lines.append(f'warn "  - SSH keys: Restore {len(ssh_keys)} key(s) manually from backup"')
         for key in ssh_keys:
-            lines.append(f'warn "      {key.get("name", "unknown")} ({key.get("type", "")})"')
+            lines.append(
+                f"warn {_q('      ' + str(key.get('name', 'unknown')) + ' (' + str(key.get('type', '')) + ')')}"
+            )
 
     gpg_keys = security.get("gpg_keys", [])
     if gpg_keys:
@@ -1199,7 +1250,7 @@ def _generate_linux_restore(logger, snapshot, output_path=None):
 
     wg = snapshot.get("network", {}).get("wireguard", [])
     if wg:
-        lines.append(f'warn "  - WireGuard: Restore {len(wg)} config(s): {", ".join(wg)}"')
+        lines.append(f"warn {_q(f'  - WireGuard: Restore {len(wg)} config(s): ' + ', '.join(map(str, wg)))}")
 
     nm_conns = snapshot.get("network", {}).get("connections", [])
     wifi_conns = [c for c in nm_conns if c.get("has_wifi_psk")]
@@ -1213,7 +1264,7 @@ def _generate_linux_restore(logger, snapshot, output_path=None):
         )
 
     if fstab:
-        lines.append('warn "  - /etc/fstab: Review /tmp/original_fstab.txt and merge"')
+        lines.append('warn "  - /etc/fstab: Review $TARGET_HOME/original_fstab.txt and merge"')
 
     lines.append('echo ""')
     lines.append('log "Done!"')
@@ -1221,8 +1272,7 @@ def _generate_linux_restore(logger, snapshot, output_path=None):
 
     # Write script
     output_path = Path(output_path)
-    output_path.write_text("\n".join(lines))
-    output_path.chmod(0o755)
+    _write_private(output_path, "\n".join(lines), mode=0o700)
 
     logger.info(f"Restore script generated: {output_path}")
     return str(output_path)
@@ -1268,7 +1318,7 @@ def _generate_windows_restore(logger, snapshot, output_path=None):
         lines.append(f'Log "Installing {len(winget_pkgs)} winget packages..."')
         for pkg in winget_pkgs:
             lines.append(
-                f'winget install --id "{pkg}" --accept-package-agreements --accept-source-agreements 2>$null'
+                f"winget install --id {_ps_q(pkg)} --accept-package-agreements --accept-source-agreements 2>$null"
             )
         lines.append("")
 
@@ -1289,7 +1339,7 @@ def _generate_windows_restore(logger, snapshot, output_path=None):
         lines.append("}")
         for pkg in choco_pkgs:
             name = pkg["name"] if isinstance(pkg, dict) else pkg
-            lines.append(f"choco install {name} -y 2>$null")
+            lines.append(f"choco install {_ps_q(name)} -y 2>$null")
         lines.append("")
 
     # npm packages
@@ -1297,7 +1347,7 @@ def _generate_windows_restore(logger, snapshot, output_path=None):
     if npm_pkgs:
         lines.append("# ═══ npm Global Packages ═══")
         lines.append(f'Log "Installing {len(npm_pkgs)} npm global packages..."')
-        lines.append(f"npm install -g {' '.join(npm_pkgs)} 2>$null")
+        lines.append(f"npm install -g {' '.join(_ps_q(p) for p in npm_pkgs)} 2>$null")
         lines.append("")
 
     # VS Code extensions
@@ -1307,7 +1357,7 @@ def _generate_windows_restore(logger, snapshot, output_path=None):
         lines.append(f'Log "Installing {len(vscode_exts)} VS Code extensions..."')
         lines.append("if (Get-Command code -ErrorAction SilentlyContinue) {")
         for ext in vscode_exts:
-            lines.append(f"    code --install-extension {ext} --force 2>$null")
+            lines.append(f"    code --install-extension {_ps_q(ext)} --force 2>$null")
         lines.append('} else { Warn "VS Code not found - install it first" }')
         lines.append("")
 
@@ -1318,7 +1368,7 @@ def _generate_windows_restore(logger, snapshot, output_path=None):
         lines.append('Log "Restoring user environment variables..."')
         for key, value in env_vars.items():
             if key.upper() not in ("PATH", "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"):
-                lines.append(f'[Environment]::SetEnvironmentVariable("{key}", "{value}", "User")')
+                lines.append(f'[Environment]::SetEnvironmentVariable({_ps_q(key)}, {_ps_q(value)}, "User")')
         lines.append("")
 
     # WSL
@@ -1327,14 +1377,14 @@ def _generate_windows_restore(logger, snapshot, output_path=None):
         lines.append("# ═══ WSL Distributions ═══")
         lines.append('Warn "Previously installed WSL distros:"')
         for distro in wsl_distros:
-            lines.append(f'Warn "  - {distro}"')
+            lines.append(f"Warn {_ps_q('  - ' + str(distro))}")
         lines.append('Warn "Install manually: wsl --install -d <distro>"')
         lines.append("")
 
     lines.append('Log "Restore complete!"')
     lines.append("")
 
-    output_path.write_text("\n".join(lines))
+    _write_private(output_path, "\n".join(lines))
     logger.info(f"Restore script generated: {output_path}")
     return str(output_path)
 

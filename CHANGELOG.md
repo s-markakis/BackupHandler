@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Telegram bot no longer auto-subscribes any chat that messages it; only
+  chat IDs in `[USERS] interacted_users` receive notifications and
+  `zip_pw` archive passwords.
+- `--install` no longer grants `NOPASSWD: tee -a /etc/fstab` (root-equivalent)
+  and rejects owner/label/UUID/mount-point values that could inject extra
+  sudoers rules. New fstab entries use `nosuid,nodev`.
+- SMTP connections (STARTTLS and implicit TLS) now verify the server
+  certificate; previously credentials could be captured by a MITM.
+- Restore rejects path traversal from SFTP file names and S3 object keys,
+  and manifest-based restore no longer copies files from outside the backup.
+- SSH clients load `known_hosts`, so a changed host key is rejected.
+- HTML email bodies are escaped; webhook/heartbeat URLs are logged as
+  `scheme://host` only.
+- Snapshot JSON and generated restore scripts are written owner-only and
+  quote every snapshot-derived value (no shell/PowerShell injection,
+  no heredoc break-out, no writes outside the target directories).
+
 ### Added
 
 - `--install` (`src/installer.py`): one-shot system bootstrap that

@@ -1042,8 +1042,8 @@ same PR as the fix.
 
 ### Telegram Bot
 1. Create a bot via [BotFather](https://t.me/BotFather) and get your API token
-2. Send any message to your bot to register your chat ID
-3. Configure `config/bot_config.ini` with your token and user ID
+2. Configure `config/bot_config.ini` with your token and your chat ID in `[USERS] interacted_users`
+3. Only chat IDs listed there can subscribe. If you don't know your ID, message the bot — it replies with the chat ID to add
 
 The bot sends notifications for:
 - Backup start/completion/failure events
@@ -1151,7 +1151,7 @@ Logs are written to `Logs/application.log` with automatic rotation:
 | `Error: config/bot_config.ini not found` | Copy `config/bot_config.ini.example` to `config/bot_config.ini` and fill in your bot token |
 | `SMTP authentication failed` | Verify `[SMTP]` credentials. For Gmail, use an App Password |
 | `ModuleNotFoundError` | Ensure venv is activated and `pip install -r requirements.txt` was run |
-| Telegram notifications not sending | Verify bot token and chat ID. Send a message to the bot first to register |
+| Telegram notifications not sending | Verify bot token and that your chat ID is listed in `[USERS] interacted_users`, then message the bot once |
 | Webhook returning non-2xx | Verify the webhook URL and auth header. Check the endpoint's expected payload format |
 | SSH connection refused | Check server address, port, and credentials. Verify the remote host key |
 | Scheduled backup not triggering | Ensure schedule times in config match HH:MM format and the process is running |

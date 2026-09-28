@@ -27,14 +27,15 @@ classifiers = [
 dependencies = [
     "boto3>=1.28.0",
     "colorama>=0.4.6",
-    "cryptography>=43.0.0",
+    "cryptography>=49.0.0",
     "keyring>=25.0.0",
-    "paramiko>=3.4.0",
-    "pyminizip>=0.2.6",
+    "paramiko>=5.0.0",
+    "pyzipper>=0.3.6",
     "pyTelegramBotAPI>=4.22.0",
-    "requests>=2.32.0",
+    "requests>=2.33.0",
     "retrying>=1.3.4",
-    "tqdm>=4.66.0",
+    "tqdm>=4.66.3",
+    "urllib3>=2.7.0",
 ]
 
 [project.optional-dependencies]
@@ -57,7 +58,7 @@ security = [
 ]
 
 [project.scripts]
-backup-handler = "main:main"
+backup-handler = "src.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/SP1R4/BackupHandler"
@@ -78,10 +79,6 @@ target-version = "py310"
 extend-exclude = [
     "venv",
     "skili",
-    "banner",
-    "bot",
-    "db_backup",
-    "email_nots",
     "BackupTimestamp",
     "snapshots",
     "Logs",
@@ -126,10 +123,6 @@ extend-exclude = '''
   \.git
   | venv
   | skili
-  | banner
-  | bot
-  | db_backup
-  | email_nots
   | snapshots
   | Logs
   | BackupTimestamp
@@ -149,10 +142,6 @@ strict_equality = true
 exclude = [
     "venv/",
     "skili/",
-    "banner/",
-    "bot/",
-    "db_backup/",
-    "email_nots/",
     "snapshots/",
     "Logs/",
     "BackupTimestamp/",
@@ -161,7 +150,7 @@ exclude = [
 [[tool.mypy.overrides]]
 module = [
     "paramiko.*",
-    "pyminizip.*",
+    "pyzipper.*",
     "telebot.*",
     "keyring.*",
     "retrying.*",
@@ -207,7 +196,7 @@ exclude_lines = [
 
 # ─── Bandit ─────────────────────────────────────────────────────────────────
 [tool.bandit]
-exclude_dirs = ["tests", "venv", "skili", "banner", "bot", "db_backup", "email_nots"]
+exclude_dirs = ["tests", "venv", "skili"]
 skips = [
     "B101",  # assert_used — fine in tests
     "B404",  # subprocess import — audited usage

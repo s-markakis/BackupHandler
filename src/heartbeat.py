@@ -18,6 +18,15 @@ from urllib.parse import urlparse
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
 
 
+def _redact_url(url: str) -> str:
+    """Reduce a URL to scheme://host for logging; paths often embed secrets."""
+    try:
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.hostname}/…" if parsed.hostname else "<invalid url>"
+    except ValueError:
+        return "<invalid url>"
+
+
 def _validate_url(url: str) -> str | None:
     if not url or not isinstance(url, str):
         return "heartbeat URL is empty"
@@ -53,12 +62,12 @@ def send_heartbeat(logger, url: str, timeout: int = 10) -> bool:
     try:
         response = requests.get(url, timeout=timeout)
     except requests.RequestException as exc:
-        logger.error(f"Heartbeat ping to {url} failed: {exc}")
+        logger.error(f"Heartbeat ping to {_redact_url(url)} failed: {type(exc).__name__}")
         return False
 
     if response.ok:
-        logger.info(f"Heartbeat ping delivered to {url}")
+        logger.info(f"Heartbeat ping delivered to {_redact_url(url)}")
         return True
 
-    logger.error(f"Heartbeat ping to {url} returned {response.status_code}")
+    logger.error(f"Heartbeat ping to {_redact_url(url)} returned {response.status_code}")
     return False

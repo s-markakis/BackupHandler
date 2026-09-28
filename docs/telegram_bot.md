@@ -52,10 +52,13 @@ This Python module provides a handler for a Telegram bot using the `telebot` lib
    api_token = YOUR_API_TOKEN
 
    [USERS]
-   interacted_users = 
+   interacted_users = 123456789, 987654321
    ```
 
-   **Note**: Ensure you replace `YOUR_API_TOKEN` with your actual Telegram bot API token.
+   **Note**: Replace `YOUR_API_TOKEN` with your bot token. `interacted_users` is an
+   **allowlist**: only these chat IDs can subscribe and receive notifications (which
+   may include `zip_pw` archive passwords). A chat that is not listed gets a reply
+   with its chat ID so an administrator can add it.
 
 ## Usage
 
@@ -63,7 +66,7 @@ To use the `TelegramBot` class, instantiate it with a logger and start the bot:
 
 ```python
 import logging
-from bot.BotHandler import TelegramBot
+from src.telegram_bot import TelegramBot
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)

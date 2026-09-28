@@ -254,7 +254,7 @@ is unmounted and the script could not remount it. Usual causes:
 3. There is no fstab entry for the mountpoint. Either run with
    `[PREFLIGHT] ensure_fstab = True` or add one manually:
    ```
-   echo "LABEL=DATA /mnt/data xfs defaults,nofail,x-systemd.device-timeout=30 0 2" | sudo tee -a /etc/fstab
+   echo "LABEL=DATA /mnt/data xfs defaults,nosuid,nodev,nofail,x-systemd.device-timeout=30 0 2" | sudo tee -a /etc/fstab
    ```
 
 **"is mounted from the WRONG volume"** — `/mnt/data` is mounted but the
@@ -318,17 +318,22 @@ Preflight self-heal needs explicit OS-level permissions. None of these
 are installed by default — the package ships them as templates for
 operators to review and apply.
 
-### 4.1 Sudoers rule (required for auto_mount + ensure_fstab)
+### 4.1 Sudoers rule (required for auto_mount)
 
 ```
 # /etc/sudoers.d/backup-handler   (mode 0440, owner root:root)
-# Allow the backup user to mount the data volume and append a single
-# fstab line. NOPASSWD is required because cron has no terminal.
+# Allow the backup user to mount the data volume.
+# NOPASSWD is required because cron has no terminal.
 backup-handler ALL=(root) NOPASSWD: /usr/bin/mount /mnt/data
 backup-handler ALL=(root) NOPASSWD: /usr/bin/mount LABEL=DATA /mnt/data
-backup-handler ALL=(root) NOPASSWD: /usr/bin/mount UUID=* /mnt/data
-backup-handler ALL=(root) NOPASSWD: /usr/bin/tee -a /etc/fstab
+backup-handler ALL=(root) NOPASSWD: /usr/bin/mount UUID=<your-uuid> /mnt/data
 ```
+
+Do **not** add a `NOPASSWD: /usr/bin/tee -a /etc/fstab` rule or a
+`UUID=*` wildcard. Being able to append arbitrary fstab lines (for
+example a `user,suid` entry) or mount any device at the destination is
+equivalent to root. Run `--install` once as root instead; it writes the
+fstab entry itself.
 
 Validate before saving with `visudo -cf /etc/sudoers.d/backup-handler`.
 If the file is malformed `sudo` itself stops working — never edit it
@@ -337,7 +342,7 @@ without `visudo`.
 ### 4.2 fstab entry (required so the disk comes back on reboot)
 
 ```
-LABEL=DATA  /mnt/data  xfs  defaults,nofail,x-systemd.device-timeout=30  0  2
+LABEL=DATA  /mnt/data  xfs  defaults,nosuid,nodev,nofail,x-systemd.device-timeout=30  0  2
 ```
 
 The `nofail` option is non-negotiable — without it, an unhealthy data

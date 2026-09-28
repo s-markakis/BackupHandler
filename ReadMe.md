@@ -65,9 +65,9 @@ Designed for sysadmins and power users who need a reliable, scriptable backup so
 | **Tailscale VPN** | Automatic Tailscale VPN connection with pre-auth keys for secure SSH backups over private tailnets |
 | **Cloud Backups (S3)** | Upload backups to AWS S3 with bandwidth throttling, multipart uploads, and concurrency control |
 | **Database Backups** | MySQL dumps via `mysqldump` with `--single-transaction` support and binary log position tracking |
-| **Encryption at Rest** | AES-256-GCM encryption with parallel processing via ThreadPoolExecutor and progress bars |
+| **Encryption at Rest** | Streaming AES-256-GCM encryption of local backups **and** client-side encryption of SSH/S3 uploads |
 | **Deduplication** | File-level deduplication using hardlinks within and across backup directories with progress bars |
-| **Compression** | ZIP compression with optional password protection (AES encryption via pyminizip) |
+| **Compression** | ZIP compression with optional AES-256 password protection (WinZip AES via pyzipper) |
 | **Backup Verification** | Verify backup integrity against manifest SHA-256 checksums with encrypted file support |
 | **Restore** | Restore from local directories, ZIP archives, SSH remotes, or S3 with point-in-time and dry-run support |
 | **Retention Policies** | Auto-cleanup by age (days) and count (N most recent), configurable per run |
@@ -96,7 +96,7 @@ Designed for sysadmins and power users who need a reliable, scriptable backup so
 
 ```
                     +==============+
-                    |   main.py    |  <- CLI entry point & scheduler
+                    |   src/cli    |  <- CLI entry point & scheduler
                     +======+=======+
                            |
                     +------+-------+
@@ -145,75 +145,75 @@ Designed for sysadmins and power users who need a reliable, scriptable backup so
 
 ```
 backup_handler/
-├── main.py                          # Entry point, CLI handling, scheduler
-├── requirements.txt                 # Python dependencies
-├── .gitignore
+├── main.py                          # Thin shim: `python main.py` == `backup-handler`
+├── requirements.txt                 # Fully pinned, audited dependency set
 │
 ├── src/
+│   ├── cli/                         # CLI package (entry point `backup-handler`)
+│   │   ├── app.py                   # Argument parsing and command routing
+│   │   ├── pipeline.py              # One backup run, one function per mode
+│   │   ├── scheduler.py             # Long-running --scheduled mode
+│   │   ├── notify.py                # Telegram / webhook / SMTP / local-mail fan-out
+│   │   ├── status.py                # --status dashboard
+│   │   └── common.py                # Paths and single-instance lock
+│   ├── snapshot/                    # System snapshot package
+│   │   ├── collectors_linux.py      # Linux state collectors
+│   │   ├── collectors_windows.py    # Windows state collectors
+│   │   ├── create.py                # Snapshot capture
+│   │   ├── restore_script.py        # bash / PowerShell restore script generation
+│   │   └── diff.py                  # Snapshot comparison
 │   ├── argparse_setup.py            # CLI argument parsing and validation
-│   ├── backup.py                    # File copy with checksum verification
-│   ├── compression.py               # ZIP compression, password-protected archives
+│   ├── banner.py                    # CLI banner display
+│   ├── compression.py               # ZIP archives (AES-256 when password-protected) + keyring
 │   ├── config.py                    # INI config loader, env var resolution, schema versioning
 │   ├── db_sync.py                   # MySQL database dump with --single-transaction
-│   ├── dedup.py                     # File-level deduplication via hardlinks with progress bars
-│   ├── email_notify.py              # SMTP email notifications (HTML + plain text) with retry
-│   ├── encryption.py                # AES-256-GCM encryption/decryption with parallel workers
+│   ├── dedup.py                     # File-level deduplication via hardlinks
+│   ├── email_notify.py              # SMTP email (notifications, attachments), TLS verified
+│   ├── encryption.py                # Streaming AES-256-GCM encryption/decryption
+│   ├── heartbeat.py                 # Dead-man's-switch ping
+│   ├── installer.py                 # --install system bootstrap
 │   ├── logger.py                    # Rotating file + console logger (AppLogger)
 │   ├── manifest.py                  # Backup manifest creation with SHA-256 checksums
+│   ├── paths.py                     # Project root resolution ($BACKUP_HANDLER_HOME)
+│   ├── preflight.py                 # Mount/ownership checks and self-heal
 │   ├── restore.py                   # Restore from local, ZIP, SSH, S3 with dry-run support
 │   ├── retention.py                 # Age-based and count-based backup cleanup
-│   ├── s3_sync.py                   # AWS S3 upload with bandwidth throttling and multipart
-│   ├── snapshot.py                   # System state snapshot & restore script generation
-│   ├── sync.py                      # Local sync, SFTP upload, backup operations
+│   ├── s3_sync.py                   # AWS S3 upload (client- and server-side encryption)
+│   ├── sync.py                      # Local sync, SFTP upload, host-key policy
 │   ├── tailscale.py                 # Tailscale VPN management (up/down/status/resolve)
-│   ├── utils.py                     # Checksums, OTP, timestamps, validation
-│   ├── verify.py                    # Backup integrity verification with checksum validation
+│   ├── telegram_bot.py              # Telegram notifications (allowlisted chats only)
+│   ├── utils.py                     # Checksums, verified copy, OTP, timestamps
+│   ├── verify.py                    # Backup integrity verification
 │   └── webhook_notify.py            # Webhook notifications (Slack, Discord, Teams, custom)
-│
-├── bot/
-│   └── BotHandler.py                # Telegram bot (notifications, documents, polling)
-│
-├── email_nots/
-│   └── email.py                     # Legacy SMTP email with attachments
-│
-├── db_backup/
-│   └── mysql_backup.py              # Standalone MySQL dump + SFTP transfer
-│
-├── banner/
-│   └── banner_show.py               # CLI banner display
 │
 ├── config/
 │   ├── config.ini.example           # Main app config template
 │   ├── bot_config.ini.example       # Telegram bot config template
-│   ├── email_config.ini.example     # Email SMTP config template
-│   └── db_config.ini.example        # MySQL backup config template
+│   └── email_config.ini.example     # Email SMTP config template
 │
-├── scripts/
-│   ├── setup.sh                     # Setup helper (venv, deps, config copies)
-│   ├── install_service.sh           # Auto-detect OS and install startup service
-│   ├── backup-handler.service       # systemd unit file (Linux)
-│   ├── com.backup-handler.plist     # launchd plist (macOS)
-│   └── install_windows_task.ps1     # Windows Task Scheduler registration
-│
-├── tests/
-│   ├── __init__.py
-│   └── test_features.py             # 46 unit tests for all major features
-│
+├── docs/telegram_bot.md             # Telegram bot API notes
+├── contrib/systemd/                 # Hardened systemd units (backup + restore drill)
+├── scripts/                         # setup, service installers, restore drill
+├── tests/                           # pytest suite
 ├── snapshots/                       # System state snapshots (auto-created)
 └── Logs/                            # Log output directory (auto-created)
 ```
+
+All runtime files (`config/`, `Logs/`, `BackupTimestamp/`, `snapshots/`) live under
+one project root: `$BACKUP_HANDLER_HOME` if set, else the source checkout, else the
+current directory (the Docker image uses `/app`).
 
 ---
 
 ## Requirements
 
-- **Python** 3.8+
+- **Python** 3.10+
 - **OS**: Linux, macOS, or Windows
 - **mysqldump** (only if using `--operation-modes db`)
 
 ### Python Dependencies
 
-All dependencies are pinned in `requirements.txt`:
+`requirements.txt` pins the full tested dependency set (audited with `pip-audit`); `pyproject.toml` sets secure minimum versions:
 
 | Package | Purpose |
 |---------|---------|
@@ -222,7 +222,7 @@ All dependencies are pinned in `requirements.txt`:
 | `cryptography` | AES-256-GCM encryption at rest |
 | `tqdm` | Progress bars for encryption, dedup, and file sync |
 | `requests` | Webhook notifications |
-| `pyminizip` | Password-protected ZIP |
+| `pyzipper` | AES-256 password-protected ZIP |
 | `keyring` | Secure credential storage |
 | `pyTelegramBotAPI` | Telegram notifications |
 | `colorama` | Colored terminal output |
@@ -276,7 +276,10 @@ All configuration is consolidated into a single `config/config.ini` file. Sensit
 | `[BACKUPS]` | `backup_dirs` | **Yes** | Comma-separated backup destination directories |
 | `[SSH]` | `ssh_servers` | When ssh=True | Comma-separated SSH server hostnames |
 | `[SSH]` | `username` | When ssh=True | SSH username |
-| `[SSH]` | `password` | When ssh=True | SSH password (supports `${SSH_PASSWORD}`) |
+| `[SSH]` | `password` | When ssh=True and no `key_file` | SSH password (supports `${SSH_PASSWORD}`) |
+| `[SSH]` | `key_file` | No | Private key for SSH auth (recommended over passwords) |
+| `[SSH]` | `strict_host_key_checking` | No | Refuse hosts not in known_hosts (default: `False` — unknown hosts are accepted with a warning; changed keys are always rejected) |
+| `[SSH]` | `known_hosts_file` | No | Extra known_hosts file to trust (in addition to `~/.ssh/known_hosts`) |
 | `[SSH]` | `bandwidth_limit` | No | SFTP bandwidth limit in KB/s (`0` = unlimited) |
 | `[S3]` | `bucket` | When s3=True | S3 bucket name |
 | `[S3]` | `prefix` | No | S3 key prefix (folder path in bucket) |
@@ -286,10 +289,13 @@ All configuration is consolidated into a single `config/config.ini` file. Sensit
 | `[S3]` | `max_bandwidth` | No | Maximum upload bandwidth in KB/s (`0` = unlimited) |
 | `[S3]` | `multipart_threshold` | No | Multipart upload threshold in MB (default: `8`) |
 | `[S3]` | `max_concurrency` | No | Maximum concurrent upload threads (default: `10`) |
+| `[S3]` | `server_side_encryption` | No | `AES256` or `aws:kms` (default: not sent) |
+| `[S3]` | `sse_kms_key_id` | No | KMS key id/alias when using `aws:kms` |
 | `[ENCRYPTION]` | `enabled` | No | Enable AES-256-GCM encryption: `True` / `False` |
 | `[ENCRYPTION]` | `key_file` | No | Path to 32-byte raw key file (takes priority over passphrase) |
 | `[ENCRYPTION]` | `passphrase` | No | Passphrase for PBKDF2 key derivation (supports `${BACKUP_ENCRYPTION_PASSPHRASE}`) |
 | `[ENCRYPTION]` | `workers` | No | Number of parallel encryption/decryption threads (default: `1`) |
+| `[ENCRYPTION]` | `remote` | No | Also encrypt SSH/S3 uploads client-side (default: `True`) |
 | `[DATABASE]` | `user` | When db=True | MySQL username |
 | `[DATABASE]` | `password` | When db=True | MySQL password (supports `${DB_PASSWORD}`) |
 | `[DATABASE]` | `database` | When db=True | Database name |
@@ -307,6 +313,7 @@ All configuration is consolidated into a single `config/config.ini` file. Sensit
 | `[WEBHOOK]` | `url` | No | Webhook URL for notifications (Slack, Discord, Teams, or custom) |
 | `[WEBHOOK]` | `auth_header` | No | Authorization header value (supports `${WEBHOOK_AUTH_TOKEN}`) |
 | `[DEDUP]` | `enabled` | No | Enable file-level deduplication: `True` / `False` |
+| `[NOTIFICATIONS]` | `send_zip_password` | No | Deliver `zip_pw` passwords via Telegram/email (default: `True`; always kept in the keyring) |
 | `[TAILSCALE]` | `enabled` | No | Enable Tailscale VPN for SSH backups: `True` / `False` |
 | `[TAILSCALE]` | `auth_key` | When enabled | Pre-authentication key (supports `${TAILSCALE_AUTH_KEY}`) |
 | `[TAILSCALE]` | `hostname` | No | Override machine hostname on the tailnet |
@@ -563,12 +570,22 @@ Backup Handler supports AES-256-GCM encryption for backup files at rest. Encrypt
 
 ### How it works
 
-- Each file is encrypted individually with the format: `[16B salt][12B nonce][ciphertext + GCM tag]`
-- Encrypted files get a `.enc` extension; originals are deleted
+- Files are encrypted **as a stream** in 1 MiB authenticated chunks — memory use does not depend on file size
+- Format: `header (magic, key source, salt, per-file seed, chunk size)` followed by chunks; each chunk is
+  authenticated together with the header and a "final chunk" flag, so tampering, reordering and truncation are detected
+- A per-file key is derived with HKDF from the master key, so nonces can never repeat
+- With a passphrase, PBKDF2 (600,000 iterations) runs **once per run**, not once per file
+- Encrypted files get a `.enc` extension; originals are deleted only after the ciphertext is fully written (atomic rename)
 - Manifest files (`backup_manifest_*.json`) are **not** encrypted (needed for status and restore lookups)
-- Encryption runs after the manifest is saved and before retention cleanup
-- Parallel encryption is supported via `[ENCRYPTION] workers` for faster processing of large backups
-- Progress bars show encryption/decryption progress
+- Pipeline order: manifest → deduplication → encryption → retention. Hardlinks created by dedup are preserved
+- If any file fails to encrypt, the run exits with code 3 (plaintext would otherwise remain in the backup)
+- Files written by older versions (whole-file v1 format) still decrypt
+
+### Remote targets (SSH / S3)
+
+When encryption is enabled, SSH and S3 uploads are encrypted **client-side** too: each file is
+encrypted to a private temp file and uploaded as `<name>.enc`, so plaintext never leaves the host.
+Restores from SSH/S3 decrypt automatically. Set `[ENCRYPTION] remote = False` to opt out.
 
 ### Key management
 
@@ -604,7 +621,7 @@ File-level deduplication uses SHA-256 hashing and hardlinks to eliminate duplica
 - **Cross-directory**: Files matching across multiple backup directories on the same filesystem are hardlinked
 - Manifests and `.enc` files are excluded from deduplication
 - Progress bars show deduplication progress
-- Runs after encryption in the backup pipeline
+- Runs before encryption; encryption keeps the hardlinks, so the savings survive
 
 Enable via config (`[DEDUP] enabled = True`) or CLI (`--dedup`).
 
@@ -1042,8 +1059,8 @@ same PR as the fix.
 
 ### Telegram Bot
 1. Create a bot via [BotFather](https://t.me/BotFather) and get your API token
-2. Send any message to your bot to register your chat ID
-3. Configure `config/bot_config.ini` with your token and user ID
+2. Configure `config/bot_config.ini` with your token and your chat ID in `[USERS] interacted_users`
+3. Only chat IDs listed there can subscribe. If you don't know your ID, message the bot — it replies with the chat ID to add
 
 The bot sends notifications for:
 - Backup start/completion/failure events
@@ -1151,7 +1168,7 @@ Logs are written to `Logs/application.log` with automatic rotation:
 | `Error: config/bot_config.ini not found` | Copy `config/bot_config.ini.example` to `config/bot_config.ini` and fill in your bot token |
 | `SMTP authentication failed` | Verify `[SMTP]` credentials. For Gmail, use an App Password |
 | `ModuleNotFoundError` | Ensure venv is activated and `pip install -r requirements.txt` was run |
-| Telegram notifications not sending | Verify bot token and chat ID. Send a message to the bot first to register |
+| Telegram notifications not sending | Verify bot token and that your chat ID is listed in `[USERS] interacted_users`, then message the bot once |
 | Webhook returning non-2xx | Verify the webhook URL and auth header. Check the endpoint's expected payload format |
 | SSH connection refused | Check server address, port, and credentials. Verify the remote host key |
 | Scheduled backup not triggering | Ensure schedule times in config match HH:MM format and the process is running |

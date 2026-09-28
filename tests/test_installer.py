@@ -158,6 +158,18 @@ class TestStepFstab:
 
 
 class TestStepSudoers:
+    def test_does_not_grant_fstab_write(self):
+        from src.installer import _render_sudoers
+
+        assert "tee" not in _render_sudoers("alice", "/mnt/data", "DATA", "abc")
+
+    def test_rejects_values_that_inject_sudoers_rules(self, logger, tmp_dir: Path):
+        sudoers = tmp_dir / "backup-handler"
+        with mock.patch.object(installer, "SUDOERS_PATH", str(sudoers)):
+            r = step_sudoers(logger, "alice", "/mnt/data", "DATA /mnt/data, /bin/sh", None, dry_run=False)
+        assert not r.ok
+        assert not sudoers.exists()
+
     def test_no_owner_skips(self, logger):
         r = step_sudoers(logger, None, "/mnt/data", "DATA", "abc", dry_run=False)
         assert r.ok and r.skipped

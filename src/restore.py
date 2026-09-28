@@ -23,6 +23,7 @@ from pathlib import Path
 from .encryption import decrypt_directory
 from .manifest import load_manifests_up_to
 from .utils import verify_backup
+from .verify import _find_file_in_backup
 
 # ─── Remote Path Detection & Parsing ────────────────────────────────────────
 
@@ -87,12 +88,30 @@ def _parse_s3_path(path):
 # ─── Remote Download Handlers ───────────────────────────────────────────────
 
 
-def _download_from_ssh(logger, ssh_path, local_dir, ssh_password=None):
+def _is_within(base, candidate):
+    """Return True if ``candidate`` resolves to a path inside ``base``."""
+    base = Path(base).resolve()
+    try:
+        Path(candidate).resolve().relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def _download_from_ssh(
+    logger,
+    ssh_path,
+    local_dir,
+    ssh_password=None,
+    strict_host_key_checking=False,
+    known_hosts_file=None,
+    ssh_key_file=None,
+):
     """
     Download an entire remote directory via SFTP to a local directory.
 
-    Uses ``paramiko.WarningPolicy`` for host key verification to avoid
-    silently accepting unknown hosts while not failing outright.
+    Host keys are verified via ``make_ssh_client`` (known_hosts enforced;
+    unknown hosts rejected when ``strict_host_key_checking`` is set).
 
     Parameters:
         logger: Logger instance.
@@ -104,7 +123,7 @@ def _download_from_ssh(logger, ssh_path, local_dir, ssh_password=None):
         bool: True if download completed successfully.
     """
     try:
-        import paramiko
+        from .sync import make_ssh_client  # imports paramiko
     except ImportError:
         logger.error("paramiko is not installed. Install it with: pip install paramiko")
         return False
@@ -112,13 +131,10 @@ def _download_from_ssh(logger, ssh_path, local_dir, ssh_password=None):
     user, host, remote_path = _parse_ssh_path(ssh_path)
     logger.info(f"Downloading from SSH: {user}@{host}:{remote_path} -> {local_dir}")
 
-    ssh = paramiko.SSHClient()
-    # WarningPolicy is deliberate — it logs unknown host keys but still connects.
-    # Upgrade to RejectPolicy + known_hosts once we ship a pinning workflow.
-    ssh.set_missing_host_key_policy(paramiko.WarningPolicy())  # noqa: S507  # nosec B507
+    ssh = make_ssh_client(strict_host_key_checking, known_hosts_file)
 
     try:
-        ssh.connect(hostname=host, username=user, password=ssh_password)
+        ssh.connect(hostname=host, username=user, password=ssh_password, key_filename=ssh_key_file)
         sftp = ssh.open_sftp()
 
         try:
@@ -152,6 +168,10 @@ def _sftp_download_recursive(sftp, remote_dir, local_dir, logger):
         return
 
     for entry in entries:
+        # A malicious server can return names like "../x" or "a/b".
+        if entry.filename in ("", ".", "..") or "/" in entry.filename or "\\" in entry.filename:
+            logger.warning(f"Skipping unsafe remote file name: {entry.filename!r}")
+            continue
         remote_entry = f"{remote_dir}/{entry.filename}"
         local_entry = local_dir / entry.filename
 
@@ -220,6 +240,10 @@ def _download_from_s3(logger, s3_path, local_dir, region=None, access_key=None, 
                     continue
 
                 local_file = local_dir / relative
+                # Object keys are attacker-influenced; never write outside local_dir.
+                if Path(relative).is_absolute() or not _is_within(local_dir, local_file):
+                    logger.warning(f"Skipping S3 object with unsafe key: {key!r}")
+                    continue
                 local_file.parent.mkdir(parents=True, exist_ok=True)
                 s3.download_file(bucket, key, str(local_file))
                 downloaded += 1
@@ -243,6 +267,9 @@ def restore_backup(
     s3_access_key=None,
     s3_secret_key=None,
     dry_run=False,
+    strict_host_key_checking=False,
+    known_hosts_file=None,
+    ssh_key_file=None,
 ):
     """
     Restore files from a local, SSH, or S3 backup source.
@@ -273,7 +300,15 @@ def restore_backup(
     # Remote SSH restore
     if _is_ssh_path(from_dir):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            if not _download_from_ssh(logger, from_dir, tmp_dir, ssh_password=ssh_password):
+            if not _download_from_ssh(
+                logger,
+                from_dir,
+                tmp_dir,
+                ssh_password=ssh_password,
+                strict_host_key_checking=strict_host_key_checking,
+                known_hosts_file=known_hosts_file,
+                ssh_key_file=ssh_key_file,
+            ):
                 return False
             return _restore_local(
                 logger, Path(tmp_dir), to_path, timestamp, encryption_passphrase, encryption_key_file
@@ -416,9 +451,19 @@ def _restore_from_zip(logger, zip_path, to_dir):
         bool: True if extraction succeeded.
     """
     logger.info(f"Restoring from ZIP archive: {zip_path}")
+    from .compression import extract_archive, get_password_by_timestamp
+
+    password = None
+    m = re.fullmatch(r"backup_(\d{8}_\d{6})\.zip", Path(zip_path).name)
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(to_dir)
+            encrypted = any(info.flag_bits & 0x1 for info in zf.infolist())
+        if encrypted:
+            password = get_password_by_timestamp(m.group(1), logger) if m else None
+            if not password:
+                logger.error(f"{zip_path} is password-protected and no password was found in the keyring")
+                return False
+        extract_archive(zip_path, to_dir, password)
         logger.info(f"Successfully restored {zip_path} to {to_dir}")
         return True
     except zipfile.BadZipFile:
@@ -526,20 +571,19 @@ def _restore_with_manifests(logger, from_dir, to_dir, timestamp):
 
     for file_path, _entry in files_to_restore.items():
         src = Path(file_path)
-        # Try to find the file in the backup directory structure
-        # The manifest records the original source path; the file is stored
-        # relative to from_dir
         if src.is_absolute():
-            # Try to find it relative to from_dir
-            for candidate_base in [from_dir]:
-                # Try matching by filename/relative path patterns
-                matches = list(candidate_base.rglob(src.name))
-                if matches:
-                    src = matches[0]
-                    break
+            # The manifest records the original source path; pick the backup
+            # file whose trailing path components match it best, so files
+            # sharing a name in different folders are not confused.
+            src = _find_file_in_backup(from_dir, file_path) or from_dir / "__missing__"
+        else:
+            src = from_dir / src
 
-        if not src.exists():
-            logger.warning(f"Source file not found for restore: {file_path}")
+        # Only restore files that live inside the backup. Without this check an
+        # absolute manifest path that is not in the backup would be copied from
+        # the live system (wrong data, and a way to exfiltrate arbitrary files).
+        if not src.exists() or not _is_within(from_dir, src):
+            logger.warning(f"Source file not found in backup for restore: {file_path}")
             failed += 1
             continue
 

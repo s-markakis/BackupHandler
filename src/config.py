@@ -161,6 +161,7 @@ def extract_config_values(
         raw_ssh_servers = normalize_none(config.get("SSH", "ssh_servers", fallback=None))
         raw_username = normalize_none(config.get("SSH", "username", fallback=None))
         raw_password = normalize_none(config.get("SSH", "password", fallback=None))
+        ssh_key_file = normalize_none(config.get("SSH", "key_file", fallback=None))
         raw_receiver_emails = normalize_none(config.get("NOTIFICATIONS", "receiver_emails", fallback=None))
 
         # Exclude patterns from config
@@ -179,6 +180,8 @@ def extract_config_values(
 
         # SSH bandwidth limit
         bandwidth_limit = config.getint("SSH", "bandwidth_limit", fallback=0)
+        ssh_strict_host_key_checking = config.getboolean("SSH", "strict_host_key_checking", fallback=False)
+        ssh_known_hosts_file = normalize_none(config.get("SSH", "known_hosts_file", fallback=None))
 
         # S3 config
         s3_bucket = normalize_none(config.get("S3", "bucket", fallback=None))
@@ -189,12 +192,15 @@ def extract_config_values(
         s3_max_bandwidth = config.getint("S3", "max_bandwidth", fallback=0)
         s3_multipart_threshold = config.getint("S3", "multipart_threshold", fallback=8)
         s3_max_concurrency = config.getint("S3", "max_concurrency", fallback=10)
+        s3_server_side_encryption = normalize_none(config.get("S3", "server_side_encryption", fallback=None))
+        s3_sse_kms_key_id = normalize_none(config.get("S3", "sse_kms_key_id", fallback=None))
 
         # Encryption config
         encryption_enabled = config.getboolean("ENCRYPTION", "enabled", fallback=False)
         encryption_key_file = normalize_none(config.get("ENCRYPTION", "key_file", fallback=None))
         encryption_passphrase = normalize_none(config.get("ENCRYPTION", "passphrase", fallback=None))
         encryption_workers = config.getint("ENCRYPTION", "workers", fallback=1)
+        encryption_remote = config.getboolean("ENCRYPTION", "remote", fallback=True)
 
         # Database config
         db_user = normalize_none(config.get("DATABASE", "user", fallback=None))
@@ -213,6 +219,9 @@ def extract_config_values(
         smtp_from = normalize_none(config.get("SMTP", "from_addr", fallback=None))
         smtp_to = normalize_none(config.get("SMTP", "to_addrs", fallback=None))
         smtp_tls = config.getboolean("SMTP", "use_tls", fallback=True)
+
+        # Whether zip_pw archive passwords are delivered via bot/email (always kept in keyring)
+        send_zip_password = config.getboolean("NOTIFICATIONS", "send_zip_password", fallback=True)
 
         # Dedup config
         dedup_enabled = config.getboolean("DEDUP", "enabled", fallback=False)
@@ -271,6 +280,7 @@ def extract_config_values(
             ),
             "ssh_username": raw_username,
             "ssh_password": raw_password,
+            "ssh_key_file": ssh_key_file,
             "schedule_times": (
                 [time.strip() for time in schedule_times.split(",") if time.strip()] if schedule_times else []
             ),
@@ -289,6 +299,8 @@ def extract_config_values(
             "max_count": max_count,
             "parallel_copies": max(1, parallel_copies),
             "bandwidth_limit": max(0, bandwidth_limit),
+            "ssh_strict_host_key_checking": ssh_strict_host_key_checking,
+            "ssh_known_hosts_file": ssh_known_hosts_file,
             "s3_bucket": s3_bucket,
             "s3_prefix": s3_prefix,
             "s3_region": s3_region,
@@ -297,10 +309,13 @@ def extract_config_values(
             "s3_max_bandwidth": s3_max_bandwidth if s3_max_bandwidth > 0 else None,
             "s3_multipart_threshold": s3_multipart_threshold,
             "s3_max_concurrency": s3_max_concurrency,
+            "s3_server_side_encryption": s3_server_side_encryption,
+            "s3_sse_kms_key_id": s3_sse_kms_key_id,
             "encryption_enabled": encryption_enabled,
             "encryption_key_file": encryption_key_file,
             "encryption_passphrase": encryption_passphrase,
             "encryption_workers": max(1, encryption_workers),
+            "encryption_remote": encryption_remote,
             "db_mode": config.getboolean("MODES", "db", fallback=False),
             "db_user": db_user,
             "db_password": db_password,
@@ -316,6 +331,7 @@ def extract_config_values(
             "smtp_from": smtp_from,
             "smtp_to": [e.strip() for e in smtp_to.split(",") if e.strip()] if smtp_to else [],
             "smtp_tls": smtp_tls,
+            "send_zip_password": send_zip_password,
             "dedup_enabled": dedup_enabled,
             "webhook_url": webhook_url,
             "webhook_auth_header": webhook_auth_header,
@@ -371,9 +387,10 @@ def extract_config_values(
                 f"  SSH Servers      : {', '.join(config_vars['ssh_servers']) if config_vars['ssh_servers'] else 'Not Set'}"
             )
             print(f"  SSH Username     : {config_vars['ssh_username'] or 'Not Set'}")
-            print(
-                f"  SSH Password     : {'*' * len(config_vars['ssh_password']) if config_vars['ssh_password'] else 'Not Set'}"
-            )
+            # Fixed mask — never reveal the password length
+            print(f"  SSH Password     : {'*****' if config_vars['ssh_password'] else 'Not Set'}")
+            print(f"  SSH Key File     : {config_vars['ssh_key_file'] or 'Not Set'}")
+            print(f"  Strict Host Keys : {config_vars['ssh_strict_host_key_checking']}")
             print(
                 f"  Bandwidth Limit  : {config_vars['bandwidth_limit']} KB/s\n"
                 if config_vars["bandwidth_limit"]
@@ -534,8 +551,13 @@ def validate_config(logger, config, require_schedule=False):
             )
         if not normalize_none(config.get("SSH", "username", fallback=None)):
             errors.append("Config error: 'username' is not set in [SSH]. Required when ssh mode is enabled")
-        if not normalize_none(config.get("SSH", "password", fallback=None)):
-            errors.append("Config error: 'password' is not set in [SSH]. Required when ssh mode is enabled")
+        if not normalize_none(config.get("SSH", "password", fallback=None)) and not normalize_none(
+            config.get("SSH", "key_file", fallback=None)
+        ):
+            errors.append(
+                "Config error: neither 'key_file' nor 'password' is set in [SSH]. "
+                "One is required when ssh mode is enabled"
+            )
 
     # Validate S3 fields only when MODES.s3 = True
     s3_enabled = False
@@ -550,6 +572,9 @@ def validate_config(logger, config, require_schedule=False):
             errors.append("Config error: 'bucket' is not set in [S3]. Required when s3 mode is enabled")
         if not normalize_none(config.get("S3", "region", fallback=None)):
             errors.append("Config error: 'region' is not set in [S3]. Required when s3 mode is enabled")
+        sse = normalize_none(config.get("S3", "server_side_encryption", fallback=None))
+        if sse and sse not in ("AES256", "aws:kms"):
+            errors.append("Config error: 'server_side_encryption' in [S3] must be AES256, aws:kms or None")
 
     # Validate encryption: when enabled, require either key_file or passphrase
     encryption_enabled = False

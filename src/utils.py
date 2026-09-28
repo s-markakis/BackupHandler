@@ -2,7 +2,7 @@
 utils.py - Shared Utilities
 
 Helper functions used across the backup pipeline: path filtering, hook
-execution, checksum calculation, timestamp persistence, keyring access,
+execution, checksum calculation, timestamp persistence,
 and input validation.
 """
 
@@ -12,16 +12,16 @@ import json
 import os
 import re
 import secrets
+import shutil
 import string
 import subprocess
 import time
 from collections.abc import Iterable
 from pathlib import Path
 
-import keyring
+from .paths import PROJECT_ROOT as _PROJECT_ROOT
 
 # Define file paths for storing timestamps of backups (absolute, relative to project root)
-_PROJECT_ROOT = Path(__file__).parent.parent
 TIMESTAMP_FILE = _PROJECT_ROOT / "BackupTimestamp" / "backup_timestamp.json"
 FULL_BACKUP_TIMESTAMP_FILE = _PROJECT_ROOT / "BackupTimestamp" / "full_backup_timestamp.json"
 
@@ -189,7 +189,7 @@ def calculate_checksum(file_path: os.PathLike | str, logger=None) -> str | None:
     hash_sha256 = hashlib.sha256()
     try:
         with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 hash_sha256.update(chunk)
     except OSError as e:
         if logger:
@@ -210,6 +210,28 @@ def verify_backup(source_file: os.PathLike | str, destination_file: os.PathLike 
     - bool: True if the checksums match, False otherwise.
     """
     return calculate_checksum(source_file) == calculate_checksum(destination_file)
+
+
+def copy_and_verify(source_file: os.PathLike | str, destination_file: os.PathLike | str) -> str | None:
+    """
+    Copy ``source_file`` to ``destination_file`` and verify the copy.
+
+    The source is hashed while it is being copied, then the destination is
+    hashed once — two reads of the data instead of the three that
+    copy + ``verify_backup`` + a separate manifest checksum would need.
+    Metadata (mode, timestamps) is preserved like ``shutil.copy2``.
+
+    Returns:
+        The SHA-256 checksum of the source if the copy verified, else None.
+    """
+    src_hash = hashlib.sha256()
+    with open(source_file, "rb") as src, open(destination_file, "wb") as dst:
+        for chunk in iter(lambda: src.read(1024 * 1024), b""):
+            src_hash.update(chunk)
+            dst.write(chunk)
+    shutil.copystat(source_file, destination_file)
+    checksum = src_hash.hexdigest()
+    return checksum if calculate_checksum(destination_file) == checksum else None
 
 
 def _get_backup_checksums(backup: os.PathLike | str) -> dict[str, str]:
@@ -294,59 +316,3 @@ def is_valid_email(email: str) -> bool:
     """
     email_pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
     return re.match(email_pattern, email) is not None
-
-
-def get_password_by_timestamp(timestamp: str, logger) -> str | None:
-    """
-    Retrieves a password from keyring using a given timestamp as the username.
-
-    Args:
-        timestamp (str): The timestamp used as the key (username) to retrieve the password.
-        logger (logging.Logger): Logger instance for logging.
-
-    Returns:
-        str: The password if found, or None if not found.
-    """
-    try:
-        service_name = "compression_service"
-        password = keyring.get_password(service_name, timestamp)
-
-        if password:
-            logger.info(f"Password retrieved successfully for timestamp: {timestamp}")
-            return password
-        else:
-            logger.warning(f"No password found for timestamp: {timestamp}")
-            return None
-    except keyring.errors.KeyringError as e:
-        logger.error(f"Failed to retrieve password for timestamp '{timestamp}': {e}")
-        return None
-
-
-def clear_keyring(service_name: str = "compression_service", logger=None) -> None:
-    """
-    Clears all stored credentials in the keyring for the specified service.
-
-    Args:
-        service_name (str): The name of the service for which to clear stored credentials.
-        logger (logging.Logger, optional): Logger instance to log messages.
-    """
-    try:
-        credentials = keyring.get_credential(service_name, None)
-
-        if credentials is not None:
-            keyring.delete_password(service_name, credentials.username)
-            msg = f"Cleared credentials for service '{service_name}'."
-        else:
-            msg = f"No credentials found for service '{service_name}'."
-
-        if logger:
-            logger.info(msg)
-        else:
-            print(msg)
-
-    except keyring.errors.KeyringError as e:
-        error_msg = f"Failed to clear keyring for service '{service_name}': {e}"
-        if logger:
-            logger.error(error_msg)
-        else:
-            print(error_msg)

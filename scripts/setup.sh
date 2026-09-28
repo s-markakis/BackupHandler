@@ -80,14 +80,13 @@ copy_config() {
 copy_config config/config.ini.example config/config.ini
 copy_config config/bot_config.ini.example config/bot_config.ini
 copy_config config/email_config.ini.example config/email_config.ini
-copy_config config/db_config.ini.example config/db_config.ini
 
 # Create Logs directory
 mkdir -p Logs
 
 # Restrict config file permissions (contain credentials)
 print_message "Setting config file permissions to owner-only (chmod 600)..."
-for ini_file in config/config.ini config/bot_config.ini config/email_config.ini config/db_config.ini; do
+for ini_file in config/config.ini config/bot_config.ini config/email_config.ini; do
     if [ -f "$ini_file" ]; then
         chmod 600 "$ini_file"
         echo -e "${GREEN}  $ini_file -> 600${NC}"

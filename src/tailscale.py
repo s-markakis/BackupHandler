@@ -7,8 +7,11 @@ with status checks to avoid disrupting existing connections.
 """
 
 import json
+import os
 import shutil
 import subprocess
+import tempfile
+from pathlib import Path
 
 
 def _run_cmd(cmd, logger=None, timeout=30):
@@ -98,7 +101,15 @@ def tailscale_up(auth_key, logger=None, hostname=None, advertise_tags=None, acce
             logger.info(f"Tailscale already connected (IP: {status['ip']}). Skipping 'tailscale up'.")
         return True
 
-    cmd = ["sudo", "tailscale", "up", "--authkey", auth_key, "--reset"]
+    # Pass the key via a private file ("file:" prefix) rather than argv, where
+    # any local user could read it from `ps` / /proc/<pid>/cmdline.
+    key_dir = tempfile.mkdtemp(prefix="backup-handler-ts-")
+    key_path = Path(key_dir) / "authkey"
+    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(auth_key)
+
+    cmd = ["sudo", "tailscale", "up", f"--auth-key=file:{key_path}", "--reset"]
 
     if hostname:
         cmd.extend(["--hostname", hostname])
@@ -110,7 +121,10 @@ def tailscale_up(auth_key, logger=None, hostname=None, advertise_tags=None, acce
     if logger:
         logger.info("Bringing Tailscale up with pre-auth key...")
 
-    rc, _stdout, stderr = _run_cmd(cmd, logger=logger, timeout=timeout)
+    try:
+        rc, _stdout, stderr = _run_cmd(cmd, logger=logger, timeout=timeout)
+    finally:
+        shutil.rmtree(key_dir, ignore_errors=True)
 
     if rc != 0:
         if logger:

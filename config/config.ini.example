@@ -24,9 +24,16 @@ backup_dirs = /path/to/backup1, /path/to/backup2
 ssh_servers = None
 # OPTIONAL: SSH username (required if ssh mode is True)
 username = None
-# OPTIONAL: SSH password (required if ssh mode is True)
+# OPTIONAL: SSH password (required if ssh mode is True and key_file is not set)
 # Supports env var syntax: password = ${SSH_PASSWORD}
 password = None
+# OPTIONAL: Private key for SSH authentication (recommended over a password)
+key_file = None
+# OPTIONAL: Refuse servers whose host key is not in known_hosts (True/False).
+# With False, unknown hosts are accepted with a warning; a CHANGED key is always rejected.
+strict_host_key_checking = False
+# OPTIONAL: Extra known_hosts file to trust (in addition to ~/.ssh/known_hosts)
+known_hosts_file = None
 # OPTIONAL: Bandwidth limit for SFTP uploads in KB/s (0 = unlimited)
 bandwidth_limit = 0
 
@@ -49,6 +56,10 @@ max_bandwidth = 0
 multipart_threshold = 8
 # OPTIONAL: Maximum concurrent upload threads (default: 10)
 max_concurrency = 10
+# OPTIONAL: Server-side encryption header — AES256 | aws:kms | None
+server_side_encryption = None
+# OPTIONAL: KMS key id or alias (only with server_side_encryption = aws:kms)
+sse_kms_key_id = None
 
 [ENCRYPTION]
 # OPTIONAL: Enable AES-256-GCM encryption at rest for backup files (True/False)
@@ -60,6 +71,8 @@ key_file = None
 passphrase = None
 # OPTIONAL: Number of parallel encryption/decryption threads (default: 1)
 workers = 1
+# OPTIONAL: Also encrypt SSH/S3 uploads client-side so plaintext never leaves this host (default: True)
+remote = True
 
 [DATABASE]
 # OPTIONAL: MySQL database user (required if db mode is True)
@@ -232,3 +245,6 @@ status_sentinel = Logs/last_run_status.json
 bot = True
 # OPTIONAL: Comma-separated email addresses for notifications, or None to disable
 receiver_emails = None
+# OPTIONAL: Deliver zip_pw archive passwords via Telegram/email (True/False).
+# Passwords are always stored in the OS keyring regardless of this setting.
+send_zip_password = True

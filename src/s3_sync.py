@@ -7,11 +7,11 @@ compares local modification times against S3 object timestamps to skip
 unchanged files. Displays a progress bar via ``tqdm`` during upload.
 """
 
-import os
 from pathlib import Path
 
 from tqdm import tqdm
 
+from .encryption import remote_name, upload_source
 from .utils import calculate_checksum, should_exclude
 
 
@@ -29,6 +29,9 @@ def sync_to_s3(
     max_bandwidth=None,
     multipart_threshold=None,
     max_concurrency=None,
+    encryption_key=None,
+    server_side_encryption=None,
+    sse_kms_key_id=None,
 ):
     """
     Sync a local directory to an S3 bucket.
@@ -44,6 +47,10 @@ def sync_to_s3(
     - mode (str): Backup mode ('full', 'incremental', 'differential').
     - exclude_patterns (list of str, optional): Glob patterns to exclude.
     - manifest (BackupManifest, optional): Manifest to record operations.
+    - encryption_key (EncryptionKey, optional): Encrypt each file client-side
+      and upload it as ``<key>.enc`` — plaintext never reaches S3.
+    - server_side_encryption (str, optional): ``AES256`` or ``aws:kms``.
+    - sse_kms_key_id (str, optional): KMS key for ``aws:kms``.
 
     Returns:
     - bool: True if sync completed successfully.
@@ -82,6 +89,12 @@ def sync_to_s3(
         transfer_kwargs["max_concurrency"] = max_concurrency
     transfer_config = TransferConfig(**transfer_kwargs) if transfer_kwargs else None
 
+    extra_args = {}
+    if server_side_encryption:
+        extra_args["ServerSideEncryption"] = server_side_encryption
+        if server_side_encryption == "aws:kms" and sse_kms_key_id:
+            extra_args["SSEKMSKeyId"] = sse_kms_key_id
+
     # Collect files to upload
     files = [
         f
@@ -96,10 +109,8 @@ def sync_to_s3(
     failed = 0
 
     for local_file in tqdm(files, desc=f"Uploading to s3://{bucket}/{prefix}", unit="files"):
-        relative = local_file.relative_to(source_path)
-        s3_key = f"{prefix}/{relative}" if prefix else str(relative)
-        # Normalize path separators for S3
-        s3_key = s3_key.replace(os.sep, "/")
+        relative = remote_name(local_file.relative_to(source_path).as_posix(), encryption_key)
+        s3_key = f"{prefix.rstrip('/')}/{relative}" if prefix else relative
 
         should_upload = True
 
@@ -124,7 +135,10 @@ def sync_to_s3(
                 upload_kwargs = {}
                 if transfer_config:
                     upload_kwargs["Config"] = transfer_config
-                s3.upload_file(str(local_file), bucket, s3_key, **upload_kwargs)
+                if extra_args:
+                    upload_kwargs["ExtraArgs"] = extra_args
+                with upload_source(local_file, encryption_key) as src:
+                    s3.upload_file(str(src), bucket, s3_key, **upload_kwargs)
                 logger.info(f"Uploaded {local_file} -> s3://{bucket}/{s3_key}")
                 uploaded += 1
                 if manifest:

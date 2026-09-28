@@ -99,3 +99,19 @@ class TestRestorePathSafety:
             ok = _restore_with_manifests(logger, backup, dest, "20990101_000000")
         assert ok is False
         assert not (dest / "secret.txt").exists()
+
+    def test_manifest_restore_picks_file_with_matching_parent(self, logger, tmp_dir):
+        from unittest import mock
+
+        from src.restore import _restore_with_manifests
+
+        backup = tmp_dir / "backup"
+        (backup / "a").mkdir(parents=True)
+        (backup / "b").mkdir(parents=True)
+        (backup / "a" / "config.ini").write_text("A")
+        (backup / "b" / "config.ini").write_text("B")
+        manifests = [{"copied": [{"path": "/srv/app/b/config.ini"}]}]
+        with mock.patch("src.restore.load_manifests_up_to", return_value=manifests):
+            assert _restore_with_manifests(logger, backup, tmp_dir / "dest", "20990101_000000")
+        assert (tmp_dir / "dest" / "b" / "config.ini").read_text() == "B"
+        assert not (tmp_dir / "dest" / "a").exists()

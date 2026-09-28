@@ -25,6 +25,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Snapshot JSON and generated restore scripts are written owner-only and
   quote every snapshot-derived value (no shell/PowerShell injection,
   no heredoc break-out, no writes outside the target directories).
+- SSH and S3 uploads are now encrypted client-side when `[ENCRYPTION]` is
+  enabled (uploaded as `<name>.enc`); previously the raw source directory
+  was uploaded in plaintext. Opt out with `[ENCRYPTION] remote = False`.
+- `[SSH] strict_host_key_checking` / `known_hosts_file` options; SSH key
+  authentication via `[SSH] key_file`.
+- Optional S3 server-side encryption (`[S3] server_side_encryption`,
+  `sse_kms_key_id`).
+- The Tailscale auth key is passed via a private file (`--auth-key=file:`)
+  instead of the command line, where `ps` exposed it.
+- `zip_pw` archives use WinZip AES-256 (`pyzipper`) instead of ZipCrypto;
+  password delivery can be disabled with `[NOTIFICATIONS] send_zip_password`.
+- Dependencies upgraded past 34 published advisories in the old pins
+  (cryptography, urllib3, requests, paramiko, PyNaCl, idna, jaraco.context).
+  `requirements.txt` is now a fully pinned, `pip-audit`-clean set.
+- `--show-setup` no longer reveals the SSH password length.
+
+### Changed
+
+- Encryption format v2: streaming 1 MiB authenticated chunks (constant
+  memory), HKDF per-file keys, truncation/reordering detection, atomic
+  writes, one PBKDF2 run per backup run instead of per file. v1 files
+  still decrypt.
+- Pipeline order is now dedup → encrypt, and encryption preserves
+  hardlinks, so dedup savings survive encryption.
+- Hash-while-copy: each file is read twice instead of three times.
+- Manifest-based restore picks the file whose path best matches the
+  manifest entry instead of the first file with the same name.
+- `main.py` split into the `src/cli/` package and `src/snapshot.py` into
+  the `src/snapshot/` package. `bot/`, `banner/` and `email_nots/` moved
+  into `src/` (`telegram_bot.py`, `banner.py`, `email_notify.py`) and are
+  now linted and type-checked. `python main.py` still works.
+- Runtime files resolve from `$BACKUP_HANDLER_HOME`, the source checkout,
+  or the current directory.
+
+### Fixed
+
+- The installed `backup-handler` command (and therefore the Docker image)
+  crashed with `ModuleNotFoundError: main`; the entry point is now
+  `src.cli:main` and the wheel contains every module it needs.
+- Encryption failures, S3 upload failures, and per-server/per-file SSH
+  failures were logged but the run still reported success (exit 0).
+- `clear_keyring` removed only one stored archive password.
+- The `zip_pw` archive flattened directory paths (same-named files collided).
+- A preflight test failed when the suite ran as root.
+
+### Removed
+
+- `db_backup/mysql_backup.py` and `config/db_config.ini.example` — a
+  standalone duplicate of `--operation-modes db` (combine with `ssh` to
+  ship the dump off-host).
+- `pyminizip` dependency.
 
 ### Added
 

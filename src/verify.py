@@ -16,7 +16,7 @@ encrypted copies are never modified.
 import tempfile
 from pathlib import Path
 
-from .encryption import decrypt_file
+from .encryption import decrypt_stream
 from .manifest import load_latest_manifest
 from .utils import calculate_checksum
 
@@ -241,8 +241,8 @@ def _verify_encrypted_file(logger, enc_path, expected_size, passphrase, key_file
     """
     Decrypt an encrypted file to a temporary directory and verify its size.
 
-    The original ``.enc`` file is copied to a temp directory before
-    decryption, ensuring the backup is never modified during verification.
+    The plaintext is streamed into a temp directory, so the backup is never
+    modified and memory use does not depend on file size.
 
     Parameters:
         logger: Logger instance.
@@ -257,10 +257,13 @@ def _verify_encrypted_file(logger, enc_path, expected_size, passphrase, key_file
     """
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_enc = Path(tmp_dir) / enc_path.name
-            # Copy enc file to temp to avoid modifying original
-            tmp_enc.write_bytes(enc_path.read_bytes())
-            decrypted = decrypt_file(tmp_enc, passphrase=passphrase, key_file=key_file)
+            # Stream-decrypt into the temp dir; the backup itself is never modified
+            decrypted = decrypt_stream(
+                enc_path,
+                Path(tmp_dir) / enc_path.name.removesuffix(".enc"),
+                passphrase=passphrase,
+                key_file=key_file,
+            )
             actual_size = decrypted.stat().st_size
             if actual_size != expected_size:
                 logger.warning(

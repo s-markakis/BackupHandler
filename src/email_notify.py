@@ -1,18 +1,28 @@
 """
 email_notify.py - SMTP Email Notification Delivery
 
-Sends plain-text email notifications for backup events (start, completion,
-failure) via SMTP with STARTTLS encryption. Includes automatic retry logic
-for transient connection failures while avoiding retries on permanent errors
-such as authentication failures.
+Two delivery paths share this module:
+
+  * ``send_smtp_email`` — notifications configured in ``[SMTP]`` of
+    config.ini (STARTTLS, HTML + plain text, retries on transient errors
+    but not on authentication failures).
+  * ``send_email`` — recipient notifications and archive-password delivery
+    configured in ``config/email_config.ini`` (implicit TLS, attachments).
+
+Every TLS connection verifies the server certificate.
 """
 
 import contextlib
 import html as html_lib
+import os
 import smtplib
 import ssl
+import time
+from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+
+from .paths import CONFIG_DIR
 
 
 def _build_html_body(subject, body):
@@ -127,3 +137,152 @@ def send_smtp_email(
                 logger.error(f"Failed to send SMTP email after {retries} attempts: {e}")
                 return False
     return False
+
+
+# ─── email_config.ini delivery (recipient notifications, attachments) ───────
+
+_EMAIL_CONFIG_PATH = CONFIG_DIR / "email_config.ini"
+
+# Cached email config with TTL (reloads after 5 minutes for long-running scheduled processes)
+_cached_email_config = None
+_cache_timestamp = 0.0
+_CACHE_TTL = 300  # seconds
+
+_SMTP_MAX_RETRIES = 2
+_SMTP_RETRY_DELAY = 3  # seconds
+
+
+def _load_email_config():
+    global _cached_email_config, _cache_timestamp
+    if _cached_email_config is not None and (time.time() - _cache_timestamp) < _CACHE_TTL:
+        return _cached_email_config
+
+    import configparser
+
+    config_path = _EMAIL_CONFIG_PATH
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Email config not found at '{config_path}'. "
+            "Copy config/email_config.ini.example to config/email_config.ini and fill in your values."
+        )
+
+    config = configparser.ConfigParser()
+    config.read(str(config_path))
+
+    if "EMAIL" not in config:
+        raise KeyError("Missing [EMAIL] section in config/email_config.ini")
+
+    email_section = config["EMAIL"]
+    sender_email = email_section.get("sender_email", "").strip()
+    app_password = email_section.get("app_password", "").strip()
+
+    if not sender_email or sender_email == "your_email@gmail.com":
+        raise ValueError("Config error: 'sender_email' is not set in config/email_config.ini [EMAIL]")
+    _placeholder = "YOUR_APP_PASSWORD"  # the .example value, not a credential
+    if not app_password or app_password == _placeholder:
+        raise ValueError("Config error: 'app_password' is not set in config/email_config.ini [EMAIL]")
+
+    smtp_host = email_section.get("smtp_host", "smtp.gmail.com").strip()
+    smtp_port = email_section.getint("smtp_port", 465)
+
+    _cached_email_config = (sender_email, app_password, smtp_host, smtp_port)
+    _cache_timestamp = time.time()
+    return _cached_email_config
+
+
+def send_email(receiver_emails, subject, body, attachment_paths=None, logger=None):
+    """
+    Send an email (with optional attachments) using ``config/email_config.ini``.
+
+    Configuration errors propagate so callers know email is misconfigured;
+    delivery errors are logged.
+    """
+    try:
+        sender_email, app_password, smtp_host, smtp_port = _load_email_config()
+
+        message = MIMEMultipart()
+        message["From"] = sender_email
+        message["To"] = ", ".join(receiver_emails)
+        message["Subject"] = subject
+        message.attach(MIMEText(body, "plain"))
+
+        if attachment_paths:
+            attach_files_to_email(message, attachment_paths, logger)
+
+        send_via_smtp(
+            sender_email,
+            app_password,
+            receiver_emails,
+            message,
+            logger,
+            smtp_host=smtp_host,
+            smtp_port=smtp_port,
+        )
+    except (FileNotFoundError, KeyError, ValueError) as e:
+        if logger:
+            logger.error(f"Email configuration error: {e}")
+        raise
+    except Exception as e:
+        if logger:
+            logger.error(f"Failed to send email: {e}")
+        else:
+            print(f"Failed to send email: {e}")
+
+
+def attach_files_to_email(message, attachment_paths, logger=None):
+    """Attach files to ``message`` as ``application/octet-stream`` parts."""
+    for attachment_path in attachment_paths:
+        try:
+            with open(attachment_path, "rb") as f:
+                attachment = MIMEApplication(f.read(), _subtype="octet-stream")
+            attachment.add_header(
+                "Content-Disposition", "attachment", filename=os.path.basename(attachment_path)
+            )
+            message.attach(attachment)
+            if logger:
+                logger.info(f"Attached file: {attachment_path}")
+        except Exception as e:
+            if logger:
+                logger.error(f"Error attaching file {attachment_path}: {e}")
+            else:
+                print(f"Error attaching file {attachment_path}: {e}")
+
+
+def send_via_smtp(
+    sender_email,
+    app_password,
+    receiver_emails,
+    message,
+    logger=None,
+    smtp_host="smtp.gmail.com",
+    smtp_port=465,
+):
+    """Send ``message`` over implicit TLS (certificate verified), retrying transient failures."""
+    for attempt in range(1, _SMTP_MAX_RETRIES + 1):
+        try:
+            with smtplib.SMTP_SSL(
+                smtp_host, smtp_port, timeout=30, context=ssl.create_default_context()
+            ) as server:
+                server.login(sender_email, app_password)
+                server.sendmail(sender_email, receiver_emails, message.as_string())
+            if logger:
+                logger.info(f"Email sent successfully to: {', '.join(receiver_emails)}")
+            return
+        except smtplib.SMTPAuthenticationError as e:
+            if logger:
+                logger.error(f"SMTP authentication failed: {e}")
+            return
+        except (smtplib.SMTPException, OSError) as e:
+            if attempt < _SMTP_MAX_RETRIES:
+                if logger:
+                    logger.warning(
+                        f"SMTP error on attempt {attempt}/{_SMTP_MAX_RETRIES}: {e}. "
+                        f"Retrying in {_SMTP_RETRY_DELAY}s..."
+                    )
+                time.sleep(_SMTP_RETRY_DELAY)
+            else:
+                msg = f"SMTP error after {_SMTP_MAX_RETRIES} attempts: {e}"
+                if logger:
+                    logger.error(msg)
+                else:
+                    print(msg)

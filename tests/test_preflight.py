@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 from pathlib import Path
 from unittest import mock
@@ -85,12 +84,11 @@ class TestEnsureWritable:
     def test_unwritable_returns_fatal_when_no_autofix(self, logger, tmp_dir: Path):
         target = tmp_dir / "ro"
         target.mkdir()
-        os.chmod(target, 0o555)  # noqa: S103 — read-only is the point of this test
-        try:
+        # Simulate an unwritable directory. chmod 0555 is not enough: root
+        # (CI containers, sudo runs) bypasses permission bits.
+        with mock.patch.object(preflight, "_is_writable", return_value=False):
             r = ensure_writable(logger, target)
-            assert r.ok is False and r.fatal is True
-        finally:
-            os.chmod(target, 0o755)  # noqa: S103 — restore so tmp_dir cleanup can rmtree
+        assert r.ok is False and r.fatal is True
 
 
 # ─── verify_destination ─────────────────────────────────────────────────────

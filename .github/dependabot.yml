@@ -18,7 +18,7 @@ updates:
           - "paramiko"
           - "cryptography"
           - "requests"
-          - "pyminizip"
+          - "pyzipper"
           - "tqdm"
           - "keyring"
       dev:

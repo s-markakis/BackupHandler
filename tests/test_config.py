@@ -71,3 +71,35 @@ class TestNormalizeNone:
     def test_valid_value(self):
         assert normalize_none("hello") == "hello"
         assert normalize_none("  hello  ") == "hello"
+
+
+class TestRemoteSecurityValidation:
+    BASE = (
+        "[DEFAULT]\nsource_dir = /src\nmode = full\n[BACKUPS]\nbackup_dirs = /b\n"
+        "[MODES]\nlocal = True\nssh = True\ns3 = True\n"
+        "[SSH]\nssh_servers = host\nusername = u\n{ssh}\n"
+        "[S3]\nbucket = b\nregion = r\n{s3}\n"
+    )
+
+    def _validate(self, logger, ssh="", s3=""):
+        import configparser
+
+        from src.config import validate_config
+
+        cfg = configparser.ConfigParser()
+        cfg.read_string(self.BASE.format(ssh=ssh, s3=s3))
+        validate_config(logger, cfg)
+
+    def test_key_file_is_enough_for_ssh(self, logger):
+        self._validate(logger, ssh="key_file = ~/.ssh/id_ed25519")
+
+    def test_ssh_needs_key_or_password(self, logger):
+        with pytest.raises(SystemExit):
+            self._validate(logger)
+
+    def test_rejects_unknown_sse_mode(self, logger):
+        with pytest.raises(SystemExit):
+            self._validate(logger, ssh="password = p", s3="server_side_encryption = rot13")
+
+    def test_accepts_kms(self, logger):
+        self._validate(logger, ssh="password = p", s3="server_side_encryption = aws:kms")

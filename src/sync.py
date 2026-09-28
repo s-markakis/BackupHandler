@@ -10,10 +10,10 @@ import paramiko
 from retrying import retry
 from tqdm import tqdm
 
-from email_nots.email import send_email
-
 from .compression import compress_directory
-from .utils import calculate_checksum, generate_otp, handle_symlink, should_exclude, verify_backup
+from .email_notify import send_email
+from .encryption import remote_name, upload_source
+from .utils import calculate_checksum, copy_and_verify, generate_otp, handle_symlink, should_exclude
 
 
 def sync_directories_with_progress(
@@ -26,6 +26,7 @@ def sync_directories_with_progress(
     exclude_patterns=None,
     manifest=None,
     parallel_copies=1,
+    send_zip_password=True,
 ):
     """
     Sync files from source directories to backup directories with progress tracking.
@@ -65,6 +66,7 @@ def sync_directories_with_progress(
             password=password,
             bot_handler=bot,
             receiver_emails=receiver_emails,
+            send_password=send_zip_password,
         )
 
     # Send notification if bot is enabled
@@ -126,15 +128,14 @@ def _copy_single_file(logger, file, src_dir, backup_dir, manifest):
                 manifest.record_copy(str(file), file.stat().st_size if file.exists() else 0)
             return
 
-        shutil.copy2(file, backup_file)
-        if verify_backup(file, backup_file):
+        checksum = copy_and_verify(file, backup_file)
+        if checksum:
             (
                 logger.info(f"Successfully backed up {file} to {backup_file}")
                 if logger
                 else print(f"Successfully backed up {file} to {backup_file}")
             )
             if manifest:
-                checksum = calculate_checksum(str(file))
                 manifest.record_copy(str(file), file.stat().st_size, checksum=checksum)
         else:
             (
@@ -148,6 +149,26 @@ def _copy_single_file(logger, file, src_dir, backup_dir, manifest):
         logger.error(f"Failed to backup {file} to {backup_file}: {e}")
         if manifest:
             manifest.record_failure(str(file), str(e))
+
+
+def make_ssh_client(strict_host_key_checking=False, known_hosts_file=None):
+    """
+    Build a paramiko client with host-key verification.
+
+    Keys in the system/user known_hosts (and ``known_hosts_file``) are always
+    enforced — a changed key raises ``BadHostKeyException``. Unknown hosts
+    are rejected when ``strict_host_key_checking`` is set; otherwise they are
+    accepted with a warning (trust on first use, not persisted).
+    """
+    ssh = paramiko.SSHClient()
+    ssh.load_system_host_keys()
+    if known_hosts_file:
+        ssh.load_host_keys(os.path.expanduser(known_hosts_file))
+    if strict_host_key_checking:
+        ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+    else:
+        ssh.set_missing_host_key_policy(paramiko.WarningPolicy())  # noqa: S507  # nosec B507
+    return ssh
 
 
 def _sftp_put_throttled(sftp, local_path, remote_path, bandwidth_limit_kbps):
@@ -191,6 +212,7 @@ def _sftp_upload_directory(
     exclude_patterns=None,
     manifest=None,
     bandwidth_limit=0,
+    encryption_key=None,
 ):
     """
     Upload a local directory to a remote server via SFTP.
@@ -204,6 +226,8 @@ def _sftp_upload_directory(
     - exclude_patterns (list of str, optional): Glob patterns to exclude.
     - manifest (BackupManifest, optional): Manifest to record file operations.
     - bandwidth_limit (int): Bandwidth limit in KB/s (0 = unlimited).
+    - encryption_key (EncryptionKey, optional): Encrypt each file client-side
+      and upload it as ``<name>.enc``.
     """
     local_path = Path(local_path)
     files = [
@@ -212,9 +236,10 @@ def _sftp_upload_directory(
         if f.is_file() and not should_exclude(f.relative_to(local_path), exclude_patterns)
     ]
 
+    failed = 0
     for local_file in tqdm(files, desc=f"Uploading to {remote_path}", unit="files"):
         relative = local_file.relative_to(local_path)
-        remote_file = f"{remote_path}/{relative}"
+        remote_file = f"{remote_path}/{remote_name(relative.as_posix(), encryption_key)}"
         remote_dir = f"{remote_path}/{relative.parent}"
 
         # Ensure remote directory exists
@@ -236,13 +261,15 @@ def _sftp_upload_directory(
 
         if should_upload:
             try:
-                _sftp_put_throttled(sftp, str(local_file), remote_file, bandwidth_limit)
+                with upload_source(local_file, encryption_key) as src:
+                    _sftp_put_throttled(sftp, str(src), remote_file, bandwidth_limit)
                 if logger:
                     logger.info(f"Uploaded {local_file} -> {remote_file}")
                 if manifest:
                     checksum = calculate_checksum(str(local_file))
                     manifest.record_copy(str(local_file), local_file.stat().st_size, checksum=checksum)
             except Exception as e:
+                failed += 1
                 if logger:
                     logger.error(f"Failed to upload {local_file}: {e}")
                 if manifest:
@@ -250,7 +277,8 @@ def _sftp_upload_directory(
 
     # In full mode, remove remote files not present locally
     if mode == "full":
-        _sftp_cleanup_extra_files(sftp, local_path, remote_path, logger)
+        _sftp_cleanup_extra_files(sftp, local_path, remote_path, logger, encryption_key=encryption_key)
+    return failed
 
 
 def _sftp_mkdirs(sftp, remote_dir, logger=None):
@@ -277,12 +305,12 @@ def _sftp_mkdirs(sftp, remote_dir, logger=None):
                 raise
 
 
-def _sftp_cleanup_extra_files(sftp, local_path, remote_path, logger=None):
+def _sftp_cleanup_extra_files(sftp, local_path, remote_path, logger=None, encryption_key=None):
     """Remove remote files that don't exist in the local source (full sync)."""
     local_files = set()
     for f in local_path.rglob("*"):
         if f.is_file():
-            local_files.add(str(f.relative_to(local_path)))
+            local_files.add(remote_name(f.relative_to(local_path).as_posix(), encryption_key))
 
     def _walk_remote(path):
         try:
@@ -320,6 +348,9 @@ def sync_ssh_server(
     exclude_patterns=None,
     manifest=None,
     bandwidth_limit=0,
+    encryption_key=None,
+    strict_host_key_checking=False,
+    known_hosts_file=None,
 ):
     """
     Sync a local directory to a remote server via SSH using SFTP, with retry logic.
@@ -336,17 +367,14 @@ def sync_ssh_server(
     - exclude_patterns (list of str, optional): Glob patterns to exclude.
     - manifest (BackupManifest, optional): Manifest to record file operations.
     - bandwidth_limit (int): Bandwidth limit in KB/s (0 = unlimited).
+    - encryption_key (EncryptionKey, optional): Client-side encryption key.
+    - strict_host_key_checking (bool): Refuse hosts missing from known_hosts.
+    - known_hosts_file (str, optional): Extra known_hosts file to trust.
     """
     if logger:
         logger.info(f"Syncing {source_dir} to SSH server: {server} in {mode} mode")
 
-    # Initialize SSH client
-    ssh = paramiko.SSHClient()
-    # WarningPolicy is deliberate — it logs unknown host keys but still connects.
-    # Upgrade to RejectPolicy + known_hosts once we ship a pinning workflow.
-    # Known hosts are still enforced: a changed key raises BadHostKeyException.
-    ssh.load_system_host_keys()
-    ssh.set_missing_host_key_policy(paramiko.WarningPolicy())  # noqa: S507  # nosec B507
+    ssh = make_ssh_client(strict_host_key_checking, known_hosts_file)
 
     try:
         # Connect to SSH server using password or private key
@@ -359,7 +387,7 @@ def sync_ssh_server(
         sftp = ssh.open_sftp()
         try:
             remote_path = source_dir  # Mirror the local path on the remote
-            _sftp_upload_directory(
+            failed = _sftp_upload_directory(
                 sftp,
                 source_dir,
                 remote_path,
@@ -368,10 +396,13 @@ def sync_ssh_server(
                 exclude_patterns=exclude_patterns,
                 manifest=manifest,
                 bandwidth_limit=bandwidth_limit,
+                encryption_key=encryption_key,
             )
         finally:
             sftp.close()
 
+        if failed:
+            raise RuntimeError(f"{failed} file(s) failed to upload to {server}")
         if logger:
             logger.info(f"Completed SSH sync to {server}")
 
@@ -401,6 +432,9 @@ def sync_ssh_servers_concurrently(
     exclude_patterns=None,
     manifest=None,
     bandwidth_limit=0,
+    encryption_key=None,
+    strict_host_key_checking=False,
+    known_hosts_file=None,
 ):
     """
     Sync a local directory to multiple SSH servers concurrently.
@@ -418,6 +452,9 @@ def sync_ssh_servers_concurrently(
     - exclude_patterns (list of str, optional): Glob patterns to exclude.
     - manifest (BackupManifest, optional): Manifest to record file operations.
     - bandwidth_limit (int): Bandwidth limit in KB/s (0 = unlimited).
+
+    Returns:
+    - list of str: Servers that failed (empty when all succeeded).
     """
 
     def sync_ssh_server_task(server):
@@ -434,31 +471,30 @@ def sync_ssh_servers_concurrently(
                 exclude_patterns=exclude_patterns,
                 manifest=manifest,
                 bandwidth_limit=bandwidth_limit,
+                encryption_key=encryption_key,
+                strict_host_key_checking=strict_host_key_checking,
+                known_hosts_file=known_hosts_file,
             )
+            return None
         except Exception as e:
             if logger:
                 logger.error(f"Failed to sync to SSH server {server}: {e}")
             else:
                 print(e)
+            return server
 
     # Execute SSH syncs concurrently with capped thread pool
     max_workers = min(len(ssh_servers), 10)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(sync_ssh_server_task, server) for server in ssh_servers]
-        for future in futures:
-            try:
-                future.result()
-            except Exception as e:
-                if logger:
-                    logger.error(f"An error occurred during SSH backup: {e}")
-                else:
-                    print(e)
+        results = list(executor.map(sync_ssh_server_task, ssh_servers))
+    failed_servers = [server for server in results if server]
 
     # Notifications
     if bot:
         bot.send_notification("Completed concurrent SSH sync")
     if receiver_emails:
         send_email(receiver_emails, "Backup Completed", f"Backup completed for {source_dir}", logger=logger)
+    return failed_servers
 
 
 def perform_full_backup(
@@ -471,6 +507,7 @@ def perform_full_backup(
     exclude_patterns=None,
     manifest=None,
     parallel_copies=1,
+    send_zip_password=True,
 ):
     """
     Perform a full backup of the source directory to the backup directories.
@@ -488,6 +525,7 @@ def perform_full_backup(
         exclude_patterns=exclude_patterns,
         manifest=manifest,
         parallel_copies=parallel_copies,
+        send_zip_password=send_zip_password,
     )
 
 
@@ -525,11 +563,10 @@ def perform_incremental_backup(
                         if manifest:
                             manifest.record_copy(str(file), file.stat().st_size if file.exists() else 0)
                         continue
-                    shutil.copy2(file, backup_file)
-                    if verify_backup(file, backup_file):
+                    checksum = copy_and_verify(file, backup_file)
+                    if checksum:
                         logger.info(f"Incremental backup of {file} to {backup_file}")
                         if manifest:
-                            checksum = calculate_checksum(str(file))
                             manifest.record_copy(str(file), file.stat().st_size, checksum=checksum)
                     else:
                         logger.error(f"Checksum verification failed for {file}")
@@ -587,11 +624,10 @@ def perform_differential_backup(
                         if manifest:
                             manifest.record_copy(str(file), file.stat().st_size if file.exists() else 0)
                         continue
-                    shutil.copy2(file, backup_file)
-                    if verify_backup(file, backup_file):
+                    checksum = copy_and_verify(file, backup_file)
+                    if checksum:
                         logger.info(f"Differential backup of {file} to {backup_file}")
                         if manifest:
-                            checksum = calculate_checksum(str(file))
                             manifest.record_copy(str(file), file.stat().st_size, checksum=checksum)
                     else:
                         logger.error(f"Checksum verification failed for {file}")
